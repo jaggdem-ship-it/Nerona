@@ -1,1 +1,0 @@
-export class PassiveSystem{constructor(player){this.player=player}}

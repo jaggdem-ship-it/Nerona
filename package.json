@@ -1,6 +1,0 @@
-{
-  "devDependencies": {
-    "@babylonjs/core": "^9.21.2",
-    "typescript": "^7.0.2"
-  }
-}

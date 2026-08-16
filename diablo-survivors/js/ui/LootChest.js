@@ -1,1 +1,0 @@
-export class LootChest{constructor(engine){this.engine=engine}show(){}hide(){}}

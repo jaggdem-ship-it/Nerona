@@ -1,1 +1,0 @@
-/* ===== MAIN ENTRY ===== */import{Engine}from'./core/Engine.js';window.addEventListener('DOMContentLoaded',async()=>{const canvas=document.getElementById('renderCanvas');canvas.width=window.innerWidth;canvas.height=window.innerHeight;const engine=new Engine(canvas);window.Game=engine;await engine.init()});
