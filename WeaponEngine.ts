@@ -1,1731 +1,1417 @@
 /**
- * ═══════════════════════════════════════════════════════════════════════════════
- * WEAPON ENGINE — GOTHIC HORDE-SURVIVAL ACTIVE ABILITY SYSTEM
- * ═══════════════════════════════════════════════════════════════════════════════
+ * WeaponEngine.ts
+ * =============================================================================
+ * Modular Active Weapon System for a Diablo-themed Vampire Survivors clone.
  *
- * Architecture: Modular ES6+ TypeScript module. Zero external runtime deps.
- * Responsibilities:
- *   • Weapon cooldown orchestration & auto-fire evaluation per frame
- *   • Projectile kinematics (euler integration, angular orbital mechanics)
- *   • 10 fully-implemented active weapon classes with distinct physics profiles
- *   • Collision-bridge dispatch → enemy tracking arrays + VFX pool triggers
- *   • Object-pooled projectile instances for hundreds of concurrent entities
+ * Architecture:
+ * - WeaponManager: Owns the active ability roster, evaluates independent
+ *   cooldown loops every frame, and bridges damage to the swarm SoA.
+ * - BaseWeapon: Abstract contract for rank, cooldown, and per-frame tick.
+ * - ProjectilePool: Zero-GC object pool for low-poly mesh projectiles.
+ * - Per-Weapon Implementations: Unique casting math, angular orbital
+ *   equations, directional sweeps, and bounding-zone collision.
  *
- * Asset Pipeline Integration:
- *   • Sprite-sheet UV slicing via frame-grid math (row/col → normalized UVs)
- *   • Angle-aware frame selection for directional projectiles
- *   • VFX atlas burst mapping for impact / spawn / death events
- * ═══════════════════════════════════════════════════════════════════════════════
+ * Integrates with:
+ *   - VFXEngine.ts    (ParticleFXPool.emitBurst)
+ *   - PlayerController.ts (position, stats snapshot, heal)
+ *   - SwarmAI.ts      (flat SoA enemy arrays via query callbacks)
+ * =============================================================================
  */
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 0: MATH PRIMITIVES & VECTOR HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
+import {
+  Scene,
+  Vector3,
+  Mesh,
+  MeshBuilder,
+  StandardMaterial,
+  Texture,
+  Color3,
+  Matrix,
+  Quaternion,
+  Sprite,
+  SpriteManager,
+} from "@babylonjs/core";
+import { ParticleFXPool } from "./VFXEngine";
+import { PlayerController, PlayerStatsSnapshot } from "./PlayerController";
 
-export interface Vec2 { x: number; y: number }
-export interface Vec3 { x: number; y: number; z: number }
+/* -------------------------------------------------------------------------- */
+/*  DATA INTERFACES & CONSTANTS                                               */
+/* -------------------------------------------------------------------------- */
 
-export const V2 = {
-  zero: (): Vec2 => ({ x: 0, y: 0 }),
-  from: (x: number, y: number): Vec2 => ({ x, y }),
-  add: (a: Vec2, b: Vec2): Vec2 => ({ x: a.x + b.x, y: a.y + b.y }),
-  sub: (a: Vec2, b: Vec2): Vec2 => ({ x: a.x - b.x, y: a.y - b.y }),
-  mul: (v: Vec2, s: number): Vec2 => ({ x: v.x * s, y: v.y * s }),
-  dot: (a: Vec2, b: Vec2): number => a.x * b.x + a.y * b.y,
-  len: (v: Vec2): number => Math.sqrt(v.x * v.x + v.y * v.y),
-  lenSq: (v: Vec2): number => v.x * v.x + v.y * v.y,
-  norm: (v: Vec2): Vec2 => {
-    const l = Math.sqrt(v.x * v.x + v.y * v.y);
-    return l > 0 ? { x: v.x / l, y: v.y / l } : { x: 0, y: 0 };
-  },
-  dist: (a: Vec2, b: Vec2): number => {
-    const dx = a.x - b.x, dy = a.y - b.y;
-    return Math.sqrt(dx * dx + dy * dy);
-  },
-  distSq: (a: Vec2, b: Vec2): number => {
-    const dx = a.x - b.x, dy = a.y - b.y;
-    return dx * dx + dy * dy;
-  },
-  rotate: (v: Vec2, angle: number): Vec2 => {
-    const c = Math.cos(angle), s = Math.sin(angle);
-    return { x: v.x * c - v.y * s, y: v.x * s + v.y * c };
-  },
-  angle: (v: Vec2): number => Math.atan2(v.y, v.x),
-  lerp: (a: Vec2, b: Vec2, t: number): Vec2 => ({
-    x: a.x + (b.x - a.x) * t,
-    y: a.y + (b.y - a.y) * t,
-  }),
-};
+/** Hard cap on simultaneous projectiles to protect frame time. */
+const MAX_PROJECTILES = 512;
+const MAX_ORBITALS = 64;
+const MAX_AOE_ZONES = 32;
 
-export const M = {
-  clamp: (v: number, min: number, max: number) => Math.max(min, Math.min(max, v)),
-  lerp: (a: number, b: number, t: number) => a + (b - a) * t,
-  degToRad: (d: number) => (d * Math.PI) / 180,
-  radToDeg: (r: number) => (r * 180) / Math.PI,
-  randRange: (min: number, max: number) => min + Math.random() * (max - min),
-  randInt: (min: number, max: number) => Math.floor(min + Math.random() * (max - min + 1)),
-  circleCircle: (p1: Vec2, r1: number, p2: Vec2, r2: number): boolean => {
-    const dx = p1.x - p2.x, dy = p1.y - p2.y;
-    const rr = r1 + r2;
-    return dx * dx + dy * dy <= rr * rr;
-  },
-  pointInCircle: (p: Vec2, c: Vec2, r: number): boolean => {
-    const dx = p.x - c.x, dy = p.y - c.y;
-    return dx * dx + dy * dy <= r * r;
-  },
-  angleDiff: (a: number, b: number): number => {
-    let d = a - b;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return d;
-  },
-};
+/** Evolution pairings: base weapon -> passive item -> ultimate name. */
+export const EVOLUTION_PAIRS: ReadonlyMap<string, { passive: string; ultimate: string }> =
+  new Map([
+    ["sinners_quills",   { passive: "flayers_edge",        ultimate: "phantom_barrage" }],
+    ["whirling_halberds",{ passive: "gothic_plate",        ultimate: "iron_fortress" }],
+    ["zealots_chain",    { passive: "spellbinders_ring",   ultimate: "heavens_wrath" }],
+    ["unholy_orbit",     { passive: "blood_onyx",          ultimate: "skeletal_cataclysm" }],
+    ["grave_burst",      { passive: "cursed_hourglass",    ultimate: "corpse_nova" }],
+    ["blood_siphon",     { passive: "vampiric_crest",      ultimate: "sanguine_vortex" }],
+    ["abyssal_rift",     { passive: "amplifying_lens",     ultimate: "doomsday_singularity" }],
+    ["font_of_torment",  { passive: "demons_luck",         ultimate: "desecrated_wake" }],
+    ["plague_swarm",     { passive: "catacomb_magnet",     ultimate: "pandemic_infestation" }],
+    ["grave_chill",      { passive: "swiftness_shard",     ultimate: "absolute_zero" }],
+  ]);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 1: ASSET ATLAS METADATA — SPRITE-SHEET UV SLICING PIPELINE
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface SpriteSheetMeta {
-  key: string;
-  path: string;
-  frameW: number;
-  frameH: number;
-  cols: number;
-  rows: number;
-  totalFrames: number;
-  transparent: boolean;
+export interface WeaponStats {
+  baseDamage: number;
+  cooldown: number;      // seconds
+  projectileSpeed: number;
+  pierce: number;        // how many enemies can be hit before dying
+  areaSize: number;      // radius multiplier
+  duration: number;      // how long the effect lasts
+  count: number;         // projectiles / orbitals / bursts per cast
 }
 
-export interface FrameUV {
-  u0: number; v0: number;
-  u1: number; v1: number;
+/** Rank-up table: each weapon defines 5 explicit ranks (+25% per rank). */
+export const WEAPON_RANK_TABLE: ReadonlyMap<string, WeaponStats> = new Map([
+  ["sinners_quills", {
+    baseDamage: 12, cooldown: 1.2, projectileSpeed: 22,
+    pierce: 1, areaSize: 1.0, duration: 0, count: 3,
+  }],
+  ["whirling_halberds", {
+    baseDamage: 18, cooldown: 1.5, projectileSpeed: 6,
+    pierce: 999, areaSize: 1.0, duration: 4.0, count: 2,
+  }],
+  ["zealots_chain", {
+    baseDamage: 15, cooldown: 1.3, projectileSpeed: 16,
+    pierce: 5, areaSize: 1.0, duration: 0.6, count: 1,
+  }],
+  ["unholy_orbit", {
+    baseDamage: 10, cooldown: 1.0, projectileSpeed: 4,
+    pierce: 999, areaSize: 1.0, duration: 5.0, count: 3,
+  }],
+  ["grave_burst", {
+    baseDamage: 35, cooldown: 3.0, projectileSpeed: 0,
+    pierce: 999, areaSize: 1.0, duration: 0.4, count: 1,
+  }],
+  ["blood_siphon", {
+    baseDamage: 8, cooldown: 0.8, projectileSpeed: 0,
+    pierce: 999, areaSize: 1.0, duration: 0.5, count: 2,
+  }],
+  ["abyssal_rift", {
+    baseDamage: 20, cooldown: 4.0, projectileSpeed: 0,
+    pierce: 999, areaSize: 1.0, duration: 3.5, count: 1,
+  }],
+  ["font_of_torment", {
+    baseDamage: 14, cooldown: 2.5, projectileSpeed: 0,
+    pierce: 999, areaSize: 1.0, duration: 4.0, count: 1,
+  }],
+  ["plague_swarm", {
+    baseDamage: 6, cooldown: 1.1, projectileSpeed: 14,
+    pierce: 2, areaSize: 1.0, duration: 2.0, count: 6,
+  }],
+  ["grave_chill", {
+    baseDamage: 5, cooldown: 0.5, projectileSpeed: 0,
+    pierce: 999, areaSize: 1.0, duration: 0.3, count: 1,
+  }],
+]);
+
+/** Flat array enemy query bridge (SwarmAI SoA integration). */
+export interface EnemyQueryBridge {
+  /** Returns indices of enemies within radius of origin. */
+  queryRadius(originX: number, originY: number, radius: number): number[];
+  /** Apply damage to enemy by SoA index. Returns true if killed. */
+  applyDamage(enemyIndex: number, amount: number): boolean;
+  /** Get enemy position by SoA index. */
+  getEnemyPosition(enemyIndex: number): { x: number; y: number } | null;
+  /** Total alive enemy count (for targeting). */
+  aliveCount: number;
 }
 
-export const AssetAtlas: Record<string, SpriteSheetMeta> = {
-  quills: {
-    key: 'quills', path: '/assets/sprites/quills_daggers.png',
-    frameW: 64, frameH: 64, cols: 14, rows: 4, totalFrames: 56, transparent: true,
-  },
-  halberds: {
-    key: 'halberds', path: '/assets/sprites/halberds_spin.png',
-    frameW: 96, frameH: 96, cols: 8, rows: 4, totalFrames: 32, transparent: true,
-  },
-  lightningArc: {
-    key: 'lightningArc', path: '/assets/vfx/lightning_discharge.png',
-    frameW: 128, frameH: 64, cols: 8, rows: 6, totalFrames: 48, transparent: true,
-  },
-  boneCage: {
-    key: 'boneCage', path: '/assets/vfx/bone_cage_orbit.png',
-    frameW: 128, frameH: 128, cols: 8, rows: 4, totalFrames: 32, transparent: true,
-  },
-  necroticEruption: {
-    key: 'necroticEruption', path: '/assets/vfx/necrotic_eruption.png',
-    frameW: 128, frameH: 128, cols: 8, rows: 4, totalFrames: 32, transparent: true,
-  },
-  bloodVortex: {
-    key: 'bloodVortex', path: '/assets/vfx/blood_vortex.png',
-    frameW: 128, frameH: 128, cols: 8, rows: 5, totalFrames: 40, transparent: true,
-  },
-  fireCarpet: {
-    key: 'fireCarpet', path: '/assets/vfx/fire_carpet.png',
-    frameW: 128, frameH: 64, cols: 8, rows: 4, totalFrames: 32, transparent: true,
-  },
-  locustSwarm: {
-    key: 'locustSwarm', path: '/assets/sprites/locust_swarm.png',
-    frameW: 128, frameH: 128, cols: 8, rows: 6, totalFrames: 48, transparent: true,
-  },
-  iceBurst: {
-    key: 'iceBurst', path: '/assets/vfx/ice_burst.png',
-    frameW: 128, frameH: 128, cols: 8, rows: 4, totalFrames: 32, transparent: true,
-  },
-  skeletonShatter: {
-    key: 'skeletonShatter', path: '/assets/vfx/skeleton_shatter.png',
-    frameW: 128, frameH: 128, cols: 6, rows: 2, totalFrames: 12, transparent: true,
-  },
-};
+/** Callback signature for floating combat text. */
+export type CombatTextFn = (pos: Vector3, text: string, isCrit: boolean) => void;
 
-export function getFrameUV(meta: SpriteSheetMeta, frameIndex: number): FrameUV {
-  const fi = Math.max(0, Math.min(frameIndex, meta.totalFrames - 1));
-  const col = fi % meta.cols;
-  const row = Math.floor(fi / meta.cols);
-  const sheetW = meta.cols * meta.frameW;
-  const sheetH = meta.rows * meta.frameH;
-  return {
-    u0: (col * meta.frameW) / sheetW,
-    v0: (row * meta.frameH) / sheetH,
-    u1: ((col + 1) * meta.frameW) / sheetW,
-    v1: ((row + 1) * meta.frameH) / sheetH,
-  };
-}
+/* -------------------------------------------------------------------------- */
+/*  PROJECTILE OBJECT POOL                                                    */
+/* -------------------------------------------------------------------------- */
 
-export function selectAngleFrame(meta: SpriteSheetMeta, angleRad: number): number {
-  const deg = ((M.radToDeg(angleRad) % 360) + 360) % 360;
-  const step = 360 / meta.totalFrames;
-  return Math.round(deg / step) % meta.totalFrames;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 2: COLLISION BRIDGE & VFX POOL INTERFACES
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface IEnemy {
-  id: number;
-  pos: Vec2;
-  radius: number;
-  hp: number;
-  maxHp: number;
-  speed: number;
-  alive: boolean;
-  slowPct?: number;
-  slowTimer?: number;
-  dotDps?: number;
-  dotTimer?: number;
-  dotSource?: string;
-}
-
-export type VFXType =
-  | 'impact_spark' | 'blood_spray' | 'bone_shatter'
-  | 'ice_shatter' | 'lightning_arc' | 'fire_burst'
-  | 'swarm_cloud' | 'rift_open' | 'rift_close';
-
-export interface IVFXRequest {
-  type: VFXType;
-  pos: Vec2;
-  angle?: number;
-  scale?: number;
-  tint?: number;
-  lifetime?: number;
-  count?: number;
-}
-
-export interface IVFXPool {
-  spawn(req: IVFXRequest): void;
-  spawnBurst(pos: Vec2, type: VFXType, count: number, radius: number): void;
-}
-
-export interface ICollisionBridge {
-  getEnemies(): IEnemy[];
-  applyDamage(enemyId: number, amount: number, sourceWeapon: string): boolean;
-  applyAreaDamage(center: Vec2, radius: number, amount: number, sourceWeapon: string): number[];
-  applyConeDamage(origin: Vec2, angleRad: number, arcRad: number, range: number, amount: number, sourceWeapon: string): number[];
-  pullEnemies(center: Vec2, radius: number, force: number, dt: number): void;
-  pushEnemies(center: Vec2, radius: number, force: number, dt: number): void;
-  applySlow(center: Vec2, radius: number, slowPct: number, duration: number, sourceWeapon: string): void;
-  applyDOT(center: Vec2, radius: number, dps: number, duration: number, sourceWeapon: string): void;
-  findNearest(pos: Vec2, maxCount: number, maxRange?: number): IEnemy[];
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 3: OBJECT POOLING
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface Poolable {
+interface PooledProjectile {
+  mesh: Mesh;
   active: boolean;
-  reset(): void;
+  life: number;
+  maxLife: number;
+  velocity: Vector3;
+  damage: number;
+  pierce: number;
+  hitMask: Set<number>; // enemy indices already struck
+  onUpdate?: (dt: number, proj: PooledProjectile) => void;
+  onDeath?: (proj: PooledProjectile) => void;
 }
 
-export class ObjectPool<T extends Poolable> {
-  private _factory: () => T;
-  private _items: T[] = [];
-  private _activeCount = 0;
+class ProjectilePool {
+  private readonly _scene: Scene;
+  private readonly _projectiles: PooledProjectile[] = [];
+  private readonly _parent: Mesh;
 
-  constructor(factory: () => T, initialCapacity = 64) {
-    this._factory = factory;
-    for (let i = 0; i < initialCapacity; i++) {
-      this._items.push(this._factory());
+  constructor(scene: Scene, maxSize: number = MAX_PROJECTILES) {
+    this._scene = scene;
+    this._parent = new Mesh("projectile_root", scene);
+    this._parent.isVisible = false;
+
+    for (let i = 0; i < maxSize; i++) {
+      const mesh = MeshBuilder.CreateBox(
+        `proj_${i}`,
+        { size: 0.3, height: 0.1 },
+        scene
+      );
+      mesh.isVisible = false;
+      mesh.parent = this._parent;
+      mesh.checkCollisions = false;
+
+      this._projectiles.push({
+        mesh,
+        active: false,
+        life: 0,
+        maxLife: 0,
+        velocity: Vector3.Zero(),
+        damage: 0,
+        pierce: 0,
+        hitMask: new Set(),
+      });
     }
   }
 
-  acquire(): T {
-    for (let i = 0; i < this._items.length; i++) {
-      if (!this._items[i].active) {
-        this._items[i].active = true;
-        this._items[i].reset();
-        this._activeCount++;
-        return this._items[i];
+  /** Acquire an idle projectile or return null if pool is exhausted. */
+  acquire(): PooledProjectile | null {
+    for (const p of this._projectiles) {
+      if (!p.active) {
+        p.active = true;
+        p.life = 0;
+        p.hitMask.clear();
+        p.velocity.setAll(0);
+        p.mesh.isVisible = true;
+        p.mesh.position.setAll(0);
+        p.mesh.rotation.setAll(0);
+        p.mesh.scaling.setAll(1);
+        return p;
       }
     }
-    const item = this._factory();
-    item.active = true;
-    this._items.push(item);
-    this._activeCount++;
-    return item;
+    return null; // hard cap reached
   }
 
-  release(item: T): void {
-    item.active = false;
-    this._activeCount = Math.max(0, this._activeCount - 1);
+  release(p: PooledProjectile): void {
+    p.active = false;
+    p.mesh.isVisible = false;
+    p.mesh.position.setAll(0);
+    p.velocity.setAll(0);
+    p.onUpdate = undefined;
+    p.onDeath = undefined;
   }
 
-  forEachActive(fn: (item: T, index: number) => void): void {
-    for (let i = 0, idx = 0; i < this._items.length; i++) {
-      if (this._items[i].active) fn(this._items[i], idx++);
-    }
+  getActive(): ReadonlyArray<PooledProjectile> {
+    return this._projectiles.filter((p) => p.active);
   }
 
-  get activeCount(): number { return this._activeCount; }
-  get capacity(): number { return this._items.length; }
-
-  cullWhere(predicate: (item: T) => boolean): void {
-    for (const item of this._items) {
-      if (item.active && predicate(item)) {
-        item.active = false;
-        this._activeCount--;
-      }
-    }
+  dispose(): void {
+    for (const p of this._projectiles) p.mesh.dispose();
+    this._parent.dispose();
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 4: PROJECTILE RUNTIME STATE
-// ═══════════════════════════════════════════════════════════════════════════════
+/* -------------------------------------------------------------------------- */
+/*  ORBITAL OBJECT POOL                                                       */
+/* -------------------------------------------------------------------------- */
 
-export type ProjectileMotionType =
-  | 'linear' | 'homing' | 'orbital' | 'stationary' | 'swarm' | 'chain';
-
-export interface IProjectile extends Poolable {
-  id: number;
-  weaponKey: string;
-  motionType: ProjectileMotionType;
-  pos: Vec2;
-  vel: Vec2;
+interface PooledOrbital {
+  mesh: Mesh;
+  active: boolean;
   angle: number;
   radius: number;
-  lifetime: number;
-  maxLifetime: number;
-  pierce: number;
-  bounces: number;
-  damage: number;
-  critChance: number;
-  critMult: number;
   speed: number;
-  accel: number;
-  turnRate: number;
-  targetId: number;
-  orbitAnchor: Vec2;
-  orbitRadius: number;
-  orbitAngle: number;
-  orbitSpeed: number;
-  zoneRadius: number;
-  tickRate: number;
-  tickTimer: number;
-  tickDamage: number;
-  spriteKey: string;
-  frameIndex: number;
-  frameTimer: number;
-  frameInterval: number;
-  scale: number;
-  opacity: number;
-  hitEnemyIds: Set<number>;
-  chainJumps: number;
-  chainRange: number;
-  chainHitIds: number[];
-  reset(): void;
+  damage: number;
+  life: number;
+  maxLife: number;
+  axisOffset: number; // for multi-orbital spacing
 }
 
-let _nextProjectileId = 1;
+class OrbitalPool {
+  private readonly _orbitals: PooledOrbital[] = [];
+  private readonly _parent: Mesh;
 
-export function createProjectile(): IProjectile {
-  return {
-    id: _nextProjectileId++,
-    active: false,
-    weaponKey: '',
-    motionType: 'linear',
-    pos: V2.zero(),
-    vel: V2.zero(),
-    angle: 0,
-    radius: 8,
-    lifetime: 0,
-    maxLifetime: 0,
-    pierce: 0,
-    bounces: 0,
-    damage: 0,
-    critChance: 0,
-    critMult: 1.5,
-    speed: 0,
-    accel: 0,
-    turnRate: 0,
-    targetId: -1,
-    orbitAnchor: V2.zero(),
-    orbitRadius: 0,
-    orbitAngle: 0,
-    orbitSpeed: 0,
-    zoneRadius: 0,
-    tickRate: 0.2,
-    tickTimer: 0,
-    tickDamage: 0,
-    spriteKey: '',
-    frameIndex: 0,
-    frameTimer: 0,
-    frameInterval: 0.05,
-    scale: 1,
-    opacity: 1,
-    hitEnemyIds: new Set(),
-    chainJumps: 0,
-    chainRange: 0,
-    chainHitIds: [],
-    reset() {
-      this.active = false;
-      this.weaponKey = '';
-      this.motionType = 'linear';
-      this.pos = V2.zero();
-      this.vel = V2.zero();
-      this.angle = 0;
-      this.radius = 8;
-      this.lifetime = 0;
-      this.maxLifetime = 0;
-      this.pierce = 0;
-      this.bounces = 0;
-      this.damage = 0;
-      this.critChance = 0;
-      this.critMult = 1.5;
-      this.speed = 0;
-      this.accel = 0;
-      this.turnRate = 0;
-      this.targetId = -1;
-      this.orbitAnchor = V2.zero();
-      this.orbitRadius = 0;
-      this.orbitAngle = 0;
-      this.orbitSpeed = 0;
-      this.zoneRadius = 0;
-      this.tickRate = 0.2;
-      this.tickTimer = 0;
-      this.tickDamage = 0;
-      this.spriteKey = '';
-      this.frameIndex = 0;
-      this.frameTimer = 0;
-      this.frameInterval = 0.05;
-      this.scale = 1;
-      this.opacity = 1;
-      this.hitEnemyIds.clear();
-      this.chainJumps = 0;
-      this.chainRange = 0;
-      this.chainHitIds = [];
-    },
-  };
+  constructor(scene: Scene, maxSize: number = MAX_ORBITALS) {
+    this._parent = new Mesh("orbital_root", scene);
+    this._parent.isVisible = false;
+
+    for (let i = 0; i < maxSize; i++) {
+      const mesh = MeshBuilder.CreateCylinder(
+        `orb_${i}`,
+        { height: 1.2, diameter: 0.15, tessellation: 6 },
+        scene
+      );
+      mesh.isVisible = false;
+      mesh.parent = this._parent;
+
+      this._orbitals.push({
+        mesh,
+        active: false,
+        angle: 0,
+        radius: 3,
+        speed: 2,
+        damage: 0,
+        life: 0,
+        maxLife: 0,
+        axisOffset: 0,
+      });
+    }
+  }
+
+  acquire(): PooledOrbital | null {
+    for (const o of this._orbitals) {
+      if (!o.active) {
+        o.active = true;
+        o.life = 0;
+        o.angle = 0;
+        o.mesh.isVisible = true;
+        o.mesh.position.setAll(0);
+        o.mesh.rotation.setAll(0);
+        return o;
+      }
+    }
+    return null;
+  }
+
+  release(o: PooledOrbital): void {
+    o.active = false;
+    o.mesh.isVisible = false;
+  }
+
+  getActive(): ReadonlyArray<PooledOrbital> {
+    return this._orbitals.filter((o) => o.active);
+  }
+
+  dispose(): void {
+    for (const o of this._orbitals) o.mesh.dispose();
+    this._parent.dispose();
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 5: WEAPON CONFIGURATION SCHEMA
-// ═══════════════════════════════════════════════════════════════════════════════
+/* -------------------------------------------------------------------------- */
+/*  AOE ZONE POOL                                                             */
+/* -------------------------------------------------------------------------- */
 
-export interface WeaponLevelStats {
-  damage: number;
-  cooldown: number;
-  projectileCount: number;
-  speed: number;
-  range: number;
+interface PooledZone {
+  mesh: Mesh;
+  active: boolean;
+  life: number;
+  maxLife: number;
   radius: number;
-  pierce: number;
-  duration: number;
-  tickRate: number;
-  special: number;
+  damage: number;
+  tickInterval: number;
+  tickTimer: number;
+  origin: Vector3;
 }
 
-export interface IWeaponConfig {
-  key: string;
-  name: string;
-  description: string;
-  maxLevel: number;
-  statsPerLevel: WeaponLevelStats[];
-  spriteKey: string;
-  vfxSpawn?: VFXType;
-  vfxImpact?: VFXType;
+class ZonePool {
+  private readonly _zones: PooledZone[] = [];
+  private readonly _parent: Mesh;
+
+  constructor(scene: Scene, maxSize: number = MAX_AOE_ZONES) {
+    this._parent = new Mesh("zone_root", scene);
+    this._parent.isVisible = false;
+
+    for (let i = 0; i < maxSize; i++) {
+      const mesh = MeshBuilder.CreateDisc(
+        `zone_${i}`,
+        { radius: 1, tessellation: 24 },
+        scene
+      );
+      mesh.rotation.x = Math.PI / 2;
+      mesh.isVisible = false;
+      mesh.parent = this._parent;
+
+      this._zones.push({
+        mesh,
+        active: false,
+        life: 0,
+        maxLife: 0,
+        radius: 1,
+        damage: 0,
+        tickInterval: 0.5,
+        tickTimer: 0,
+        origin: Vector3.Zero(),
+      });
+    }
+  }
+
+  acquire(): PooledZone | null {
+    for (const z of this._zones) {
+      if (!z.active) {
+        z.active = true;
+        z.life = 0;
+        z.tickTimer = 0;
+        z.mesh.isVisible = true;
+        return z;
+      }
+    }
+    return null;
+  }
+
+  release(z: PooledZone): void {
+    z.active = false;
+    z.mesh.isVisible = false;
+    z.mesh.scaling.setAll(1);
+  }
+
+  getActive(): ReadonlyArray<PooledZone> {
+    return this._zones.filter((z) => z.active);
+  }
+
+  dispose(): void {
+    for (const z of this._zones) z.mesh.dispose();
+    this._parent.dispose();
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 6: BASE ACTIVE WEAPON CLASS
-// ═══════════════════════════════════════════════════════════════════════════════
+/* -------------------------------------------------------------------------- */
+/*  BASE WEAPON ABSTRACT CLASS                                                */
+/* -------------------------------------------------------------------------- */
 
-export abstract class BaseActiveWeapon {
-  public level = 1;
-  public cooldownTimer = 0;
-  public isUnlocked = false;
+export abstract class BaseWeapon {
+  public readonly id: string;
+  public rank: number = 1;
+  public isEvolved: boolean = false;
 
-  public damageMult = 1;
-  public cooldownMult = 1;
-  public areaMult = 1;
-  public speedMult = 1;
-  public durationMult = 1;
-  public projectileCountBonus = 0;
+  protected _cooldownTimer: number = 0;
+  protected _stats: WeaponStats;
+  protected _scene: Scene;
+  protected _vfx: ParticleFXPool;
+  protected _player: PlayerController;
+  protected _bridge: EnemyQueryBridge;
+  protected _combatText: CombatTextFn | null = null;
 
   constructor(
-    public readonly config: IWeaponConfig,
-    protected _pool: ObjectPool<IProjectile>,
-    protected _bridge: ICollisionBridge,
-    protected _vfx: IVFXPool,
-  ) {}
-
-  get currentStats(): WeaponLevelStats {
-    const idx = Math.min(this.level - 1, this.config.statsPerLevel.length - 1);
-    return this.config.statsPerLevel[idx];
+    id: string,
+    scene: Scene,
+    vfx: ParticleFXPool,
+    player: PlayerController,
+    bridge: EnemyQueryBridge
+  ) {
+    this.id = id;
+    this._scene = scene;
+    this._vfx = vfx;
+    this._player = player;
+    this._bridge = bridge;
+    const base = WEAPON_RANK_TABLE.get(id);
+    if (!base) throw new Error(`Unknown weapon id: ${id}`);
+    this._stats = { ...base };
   }
 
-  get effectiveCooldown(): number {
-    return this.currentStats.cooldown * this.cooldownMult;
+  /** Inject combat text callback. */
+  public setCombatText(fn: CombatTextFn): void {
+    this._combatText = fn;
   }
 
-  get effectiveDamage(): number {
-    return this.currentStats.damage * this.damageMult;
-  }
-
-  get effectiveSpeed(): number {
-    return this.currentStats.speed * this.speedMult;
-  }
-
-  get effectiveRange(): number {
-    return this.currentStats.range * this.areaMult;
-  }
-
-  get effectiveRadius(): number {
-    return this.currentStats.radius * this.areaMult;
-  }
-
-  get effectiveDuration(): number {
-    return this.currentStats.duration * this.durationMult;
-  }
-
-  get effectiveProjectileCount(): number {
-    return this.currentStats.projectileCount + this.projectileCountBonus;
-  }
-
-  abstract update(dt: number, playerPos: Vec2, facingAngle: number): void;
-  protected abstract _fire(playerPos: Vec2, facingAngle: number): void;
-
-  protected _evalCooldown(dt: number, playerPos: Vec2, facingAngle: number): void {
-    if (!this.isUnlocked) return;
-    this.cooldownTimer -= dt;
-    if (this.cooldownTimer <= 0) {
-      this._fire(playerPos, facingAngle);
-      this.cooldownTimer = this.effectiveCooldown;
+  /** Rank up the weapon, scaling stats by +25% per rank. */
+  public rankUp(): void {
+    if (this.rank >= 5) return;
+    this.rank++;
+    const m = 1.25;
+    this._stats.baseDamage *= m;
+    this._stats.projectileSpeed *= 1.1;
+    this._stats.areaSize *= 1.15;
+    this._stats.count = Math.floor(this._stats.count * 1.2 + 0.5);
+    if (this._stats.cooldown > 0.2) {
+      this._stats.cooldown *= 0.85;
     }
   }
 
-  protected _spawnProjectile(overrides: Partial<IProjectile> = {}): IProjectile {
-    const p = this._pool.acquire();
-    p.weaponKey = this.config.key;
-    p.damage = this.effectiveDamage;
-    p.speed = this.effectiveSpeed;
-    p.lifetime = this.effectiveDuration;
-    p.maxLifetime = this.effectiveDuration;
-    p.radius = this.effectiveRadius;
-    p.pierce = this.currentStats.pierce;
-    p.spriteKey = this.config.spriteKey;
-    p.scale = 1;
-    p.opacity = 1;
-    p.hitEnemyIds.clear();
-    p.chainHitIds = [];
-    Object.assign(p, overrides);
-    return p;
+  /** Called every frame by WeaponManager. */
+  public tick(deltaTime: number): void {
+    if (this._cooldownTimer > 0) {
+      this._cooldownTimer -= deltaTime;
+    }
+    if (this._cooldownTimer <= 0) {
+      this._fire();
+      this._cooldownTimer = this._getEffectiveCooldown();
+    }
+    this._updateActive(deltaTime);
   }
 
-  protected _resolveImpact(proj: IProjectile, enemy: IEnemy): void {
-    if (proj.hitEnemyIds.has(enemy.id)) return;
-    proj.hitEnemyIds.add(enemy.id);
-
-    let dmg = proj.damage;
-    if (Math.random() < proj.critChance) dmg *= proj.critMult;
-
-    const died = this._bridge.applyDamage(enemy.id, dmg, this.config.key);
-
-    this._vfx.spawn({
-      type: this.config.vfxImpact ?? 'impact_spark',
-      pos: V2.lerp(proj.pos, enemy.pos, 0.5),
-      scale: 0.8 + Math.random() * 0.4,
-    });
-
-    if (died) {
-      this._vfx.spawnBurst(enemy.pos, 'bone_shatter', 4, 20);
-    }
-
-    if (proj.pierce >= 0) {
-      proj.pierce--;
-      if (proj.pierce < 0) {
-        proj.active = false;
-        this._pool.release(proj);
-      }
-    }
+  /** Effective cooldown reduced by player attack speed (hard cap 60% CDR). */
+  protected _getEffectiveCooldown(): number {
+    const snapshot = this._player.getStatsSnapshot();
+    const asMod = Math.min(snapshot.passiveAttackSpeed, 2.5); // max 2.5x atk spd
+    const cdr = Math.min(0.6, (asMod - 1) * 0.4); // 60% cap
+    return this._stats.cooldown * (1 - cdr);
   }
 
-  protected _updateProjectileFrame(proj: IProjectile, dt: number, meta: SpriteSheetMeta): void {
-    proj.frameTimer -= dt;
-    if (proj.frameTimer <= 0) {
-      proj.frameTimer = proj.frameInterval;
-      proj.frameIndex = (proj.frameIndex + 1) % meta.totalFrames;
-    }
+  /** Effective damage scaled by player damage modifier and crit. */
+  protected _rollDamage(): { damage: number; isCrit: boolean } {
+    const snapshot = this._player.getStatsSnapshot();
+    let dmg = this._stats.baseDamage * snapshot.passiveDamageMod;
+    let isCrit = Math.random() < snapshot.passiveCritChance;
+    if (isCrit) dmg *= snapshot.passiveCritDamage;
+    // Evolved weapons deal 1.5x base
+    if (this.isEvolved) dmg *= 1.5;
+    return { damage: Math.round(dmg), isCrit };
   }
 
-  protected _updateLinear(proj: IProjectile, dt: number): void {
-    proj.pos = V2.add(proj.pos, V2.mul(proj.vel, dt));
-    proj.lifetime -= dt;
-    if (proj.lifetime <= 0) {
-      proj.active = false;
-      this._pool.release(proj);
+  /** Spawn a burst VFX at world position. */
+  protected _spawnVFX(name: "blood_spray" | "void_glow" | "frost_haze", pos: Vector3, count: number): void {
+    this._vfx.emitBurst(name, pos, count);
+  }
+
+  /** Apply damage to an enemy index, handling kill confirmation. */
+  protected _damageEnemy(enemyIndex: number, amount: number, isCrit: boolean): void {
+    const pos = this._bridge.getEnemyPosition(enemyIndex);
+    if (!pos) return;
+
+    const killed = this._bridge.applyDamage(enemyIndex, amount);
+    if (this._combatText) {
+      this._combatText(
+        new Vector3(pos.x, 1.5, pos.y),
+        amount.toString(),
+        isCrit
+      );
+    }
+    if (killed) {
+      this._spawnVFX("blood_spray", new Vector3(pos.x, 1.0, pos.y), 12);
     }
   }
 
-  protected _updateOrbital(proj: IProjectile, dt: number): void {
-    proj.orbitAngle += proj.orbitSpeed * dt;
-    proj.pos = {
-      x: proj.orbitAnchor.x + Math.cos(proj.orbitAngle) * proj.orbitRadius,
-      y: proj.orbitAnchor.y + Math.sin(proj.orbitAngle) * proj.orbitRadius,
-    };
-    proj.angle = proj.orbitAngle + Math.PI / 2;
-    proj.lifetime -= dt;
-    if (proj.lifetime <= 0) {
-      proj.active = false;
-      this._pool.release(proj);
-    }
-  }
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 7: WEAPON IMPLEMENTATIONS (10 BASE ACTIVE WEAPONS)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.1 SINNER'S QUILLS — Projectile Fan
-// ───────────────────────────────────────────────────────────────────────────────
-
-export class SinnersQuills extends BaseActiveWeapon {
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-  }
-
-  protected _fire(playerPos: Vec2, facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const spreadArc = M.degToRad(45 + this.level * 5);
-    const baseDir = facingAngle;
-    const meta = AssetAtlas.quills;
-
-    for (let i = 0; i < count; i++) {
-      const t = count === 1 ? 0 : (i / (count - 1)) - 0.5;
-      const angle = baseDir + t * spreadArc;
-      const dir = { x: Math.cos(angle), y: Math.sin(angle) };
-
-      this._spawnProjectile({
-        motionType: 'linear',
-        pos: V2.add(playerPos, V2.mul(dir, 12)),
-        vel: V2.mul(dir, this.effectiveSpeed),
-        angle,
-        radius: this.effectiveRadius,
-        pierce: this.currentStats.pierce,
-        spriteKey: meta.key,
-        frameIndex: selectAngleFrame(meta, angle),
-        frameInterval: 0,
-      });
-    }
-
-    this._vfx.spawn({ type: 'impact_spark', pos: playerPos, scale: 0.5 });
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.2 WHIRLING HALBERDS — Orbital Spinners
-// ───────────────────────────────────────────────────────────────────────────────
-
-export class WhirlingHalberds extends BaseActiveWeapon {
-  private _orbitals: IProjectile[] = [];
-
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._syncOrbitals(playerPos, dt);
-  }
-
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const meta = AssetAtlas.halberds;
-
-    for (let i = 0; i < count; i++) {
-      const angleOffset = (Math.PI * 2 * i) / count;
-      const p = this._spawnProjectile({
-        motionType: 'orbital',
-        orbitAnchor: { ...playerPos },
-        orbitRadius: this.effectiveRange,
-        orbitAngle: angleOffset,
-        orbitSpeed: this.effectiveSpeed / this.effectiveRange,
-        radius: this.effectiveRadius,
-        pierce: -1,
-        lifetime: this.effectiveDuration,
-        spriteKey: meta.key,
-        frameIndex: 0,
-        frameInterval: 0.03,
-      });
-      this._orbitals.push(p);
-    }
-
-    this._vfx.spawn({ type: 'impact_spark', pos: playerPos, scale: 0.6 });
-  }
-
-  private _syncOrbitals(playerPos: Vec2, dt: number): void {
-    const meta = AssetAtlas.halberds;
-    this._orbitals = this._orbitals.filter(o => o.active);
-
-    for (const o of this._orbitals) {
-      o.orbitAnchor = { ...playerPos };
-      this._updateOrbital(o, dt);
-      this._updateProjectileFrame(o, dt, meta);
-
-      const enemies = this._bridge.getEnemies();
-      for (const e of enemies) {
-        if (!e.alive) continue;
-        if (M.circleCircle(o.pos, o.radius, e.pos, e.radius)) {
-          this._resolveImpact(o, e);
-        }
-      }
-    }
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.3 ZEALOT'S CHAIN — Chain Lightning
-// ───────────────────────────────────────────────────────────────────────────────
-
-export class ZealotsChain extends BaseActiveWeapon {
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-  }
-
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    const targets = this._bridge.findNearest(playerPos, 1, this.effectiveRange);
-    if (targets.length === 0) return;
-
-    const primary = targets[0];
-    const jumps = this.currentStats.special;
-    const jumpRange = this.effectiveRange * 0.6;
-    const meta = AssetAtlas.lightningArc;
-
-    const dir = V2.norm(V2.sub(primary.pos, playerPos));
-    const p = this._spawnProjectile({
-      motionType: 'chain',
-      pos: { ...playerPos },
-      vel: V2.mul(dir, this.effectiveSpeed),
-      angle: V2.angle(dir),
-      radius: this.effectiveRadius,
-      damage: this.effectiveDamage,
-      pierce: -1,
-      lifetime: 0.4,
-      chainJumps: jumps,
-      chainRange: jumpRange,
-      chainHitIds: [primary.id],
-      spriteKey: meta.key,
-      frameIndex: M.randInt(0, meta.totalFrames - 1),
-      frameInterval: 0.02,
-    });
-
-    this._bridge.applyDamage(primary.id, this.effectiveDamage, this.config.key);
-    this._vfx.spawn({
-      type: 'lightning_arc',
-      pos: primary.pos,
-      scale: 1.2,
-      count: 3,
-    });
-
-    this._resolveChain(p, primary, jumpRange, jumps);
-  }
-
-  private _resolveChain(
-    proj: IProjectile,
-    lastHit: IEnemy,
-    range: number,
-    jumpsLeft: number,
-  ): void {
-    if (jumpsLeft <= 0) return;
-
-    const enemies = this._bridge.getEnemies();
-    let best: IEnemy | null = null;
-    let bestDist = range * range;
-
-    for (const e of enemies) {
-      if (!e.alive || proj.chainHitIds.includes(e.id)) continue;
-      const d2 = V2.distSq(lastHit.pos, e.pos);
+  /** Find nearest enemy index to a world position, or -1. */
+  protected _findNearest(origin: Vector3, maxRange: number = 9999): number {
+    if (this._bridge.aliveCount === 0) return -1;
+    const indices = this._bridge.queryRadius(origin.x, origin.z, maxRange);
+    let best = -1;
+    let bestDist = Infinity;
+    for (const idx of indices) {
+      const p = this._bridge.getEnemyPosition(idx);
+      if (!p) continue;
+      const dx = p.x - origin.x;
+      const dy = p.y - origin.z;
+      const d2 = dx * dx + dy * dy;
       if (d2 < bestDist) {
         bestDist = d2;
-        best = e;
+        best = idx;
       }
     }
-
-    if (!best) return;
-
-    proj.chainHitIds.push(best.id);
-    const dmg = this.effectiveDamage * Math.pow(0.75, proj.chainHitIds.length - 1);
-    this._bridge.applyDamage(best.id, dmg, this.config.key);
-
-    const mid = V2.lerp(lastHit.pos, best.pos, 0.5);
-    this._vfx.spawn({
-      type: 'lightning_arc',
-      pos: mid,
-      angle: V2.angle(V2.sub(best.pos, lastHit.pos)),
-      scale: 1.0 - (proj.chainHitIds.length - 1) * 0.15,
-      count: 2,
-    });
-
-    this._resolveChain(proj, best, range, jumpsLeft - 1);
+    return best;
   }
+
+  protected abstract _fire(): void;
+  protected abstract _updateActive(deltaTime: number): void;
+  public abstract dispose(): void;
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.4 UNHOLY ORBIT — Bone Cage Orbital
-// ───────────────────────────────────────────────────────────────────────────────
+/* -------------------------------------------------------------------------- */
+/*  1. SINNER'S QUILLS -- Forward-firing dagger projectiles                    */
+/* -------------------------------------------------------------------------- */
 
-export class UnholyOrbit extends BaseActiveWeapon {
-  private _orbitals: IProjectile[] = [];
+export class SinnersQuills extends BaseWeapon {
+  private readonly _pool: ProjectilePool;
+  private _material: StandardMaterial;
 
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._syncOrbitals(playerPos, dt);
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("sinners_quills", scene, vfx, player, bridge);
+    this._pool = new ProjectilePool(scene, MAX_PROJECTILES);
+
+    this._material = new StandardMaterial("quill_mat", scene);
+    this._material.diffuseColor = new Color3(0.8, 0.1, 0.1);
+    this._material.emissiveColor = new Color3(0.4, 0.0, 0.0);
+    this._material.specularColor = new Color3(0.3, 0.3, 0.3);
+    // Texture atlas slice would be bound here in full pipeline
+    // this._material.diffuseTexture = new Texture("assets/sinners_quills.png", scene);
   }
 
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const meta = AssetAtlas.boneCage;
+  protected _fire(): void {
+    const origin = this._player.position;
+    const count = this._stats.count;
+    const spreadArc = Math.PI / 6; // 30-degree spread
 
     for (let i = 0; i < count; i++) {
-      const angleOffset = (Math.PI * 2 * i) / count;
-      const p = this._spawnProjectile({
-        motionType: 'orbital',
-        orbitAnchor: { ...playerPos },
-        orbitRadius: this.effectiveRange,
-        orbitAngle: angleOffset,
-        orbitSpeed: -this.effectiveSpeed / this.effectiveRange,
-        radius: this.effectiveRadius,
-        pierce: -1,
-        lifetime: this.effectiveDuration,
-        damage: this.effectiveDamage * 1.2,
-        spriteKey: meta.key,
-        frameIndex: 0,
-        frameInterval: 0.04,
-        scale: 1 + this.level * 0.15,
-      });
-      this._orbitals.push(p);
-    }
+      const proj = this._pool.acquire();
+      if (!proj) break;
 
-    this._vfx.spawn({ type: 'bone_shatter', pos: playerPos, scale: 0.8 });
+      const targetIdx = this._findNearest(origin, 25);
+      let dir: Vector3;
+      if (targetIdx >= 0) {
+        const tp = this._bridge.getEnemyPosition(targetIdx)!;
+        dir = new Vector3(tp.x - origin.x, 0, tp.y - origin.z).normalize();
+      } else {
+        dir = new Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+        if (dir.lengthSquared() < 0.01) dir.z = 1;
+      }
+
+      // Spread for multi-projectile casts
+      if (count > 1) {
+        const angle = (i / (count - 1) - 0.5) * spreadArc;
+        const sin = Math.sin(angle);
+        const cos = Math.cos(angle);
+        dir = new Vector3(dir.x * cos - dir.z * sin, 0, dir.x * sin + dir.z * cos);
+      }
+
+      proj.mesh.position.copyFrom(origin);
+      proj.mesh.position.y = 1.0;
+      proj.velocity = dir.scale(this._stats.projectileSpeed);
+      proj.maxLife = 3.0;
+      proj.pierce = this._stats.pierce;
+      const roll = this._rollDamage();
+      proj.damage = roll.damage;
+
+      // Visual: point mesh along velocity
+      proj.mesh.lookAt(proj.mesh.position.add(proj.velocity));
+      proj.mesh.material = this._material;
+    }
   }
 
-  private _syncOrbitals(playerPos: Vec2, dt: number): void {
-    const meta = AssetAtlas.boneCage;
-    this._orbitals = this._orbitals.filter(o => o.active);
+  protected _updateActive(dt: number): void {
+    for (const p of this._pool.getActive()) {
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        this._pool.release(p);
+        continue;
+      }
 
-    for (const o of this._orbitals) {
-      o.orbitAnchor = { ...playerPos };
-      this._updateOrbital(o, dt);
-      this._updateProjectileFrame(o, dt, meta);
+      // Forward sweep
+      p.mesh.position.addInPlace(p.velocity.scale(dt));
 
-      const enemies = this._bridge.getEnemies();
-      for (const e of enemies) {
-        if (!e.alive) continue;
-        if (M.circleCircle(o.pos, o.radius, e.pos, e.radius)) {
-          this._bridge.pushEnemies(o.pos, o.radius * 2, 120, dt);
-          this._resolveImpact(o, e);
+      // Collision vs enemy radii
+      const enemies = this._bridge.queryRadius(p.mesh.position.x, p.mesh.position.z, 1.2);
+      for (const idx of enemies) {
+        if (p.hitMask.has(idx)) continue;
+        const epos = this._bridge.getEnemyPosition(idx);
+        if (!epos) continue;
+
+        const dx = epos.x - p.mesh.position.x;
+        const dz = epos.y - p.mesh.position.z;
+        if (dx * dx + dz * dz < 1.0) { // radius 1.0 hit
+          p.hitMask.add(idx);
+          const roll = this._rollDamage();
+          this._damageEnemy(idx, roll.damage, roll.isCrit);
+          this._spawnVFX("blood_spray", p.mesh.position, 6);
+
+          if (p.hitMask.size > p.pierce) {
+            this._pool.release(p);
+            break;
+          }
         }
       }
     }
   }
+
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
+  }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.5 GRAVE BURST — Ground Eruption
-// ───────────────────────────────────────────────────────────────────────────────
+/* -------------------------------------------------------------------------- */
+/*  2. WHIRLING HALBERDS -- Orbital spinning melee blades                      */
+/* -------------------------------------------------------------------------- */
 
-export class GraveBurst extends BaseActiveWeapon {
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._updateBursts(dt);
+export class WhirlingHalberds extends BaseWeapon {
+  private readonly _pool: OrbitalPool;
+  private _material: StandardMaterial;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("whirling_halberds", scene, vfx, player, bridge);
+    this._pool = new OrbitalPool(scene, MAX_ORBITALS);
+
+    this._material = new StandardMaterial("halberd_mat", scene);
+    this._material.diffuseColor = new Color3(0.6, 0.6, 0.7);
+    this._material.emissiveColor = new Color3(0.1, 0.1, 0.15);
   }
 
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const meta = AssetAtlas.necroticEruption;
+  protected _fire(): void {
+    const origin = this._player.position;
+    const count = this._stats.count;
 
     for (let i = 0; i < count; i++) {
-      const r = Math.sqrt(Math.random()) * this.effectiveRange;
-      const theta = Math.random() * Math.PI * 2;
-      const offset = { x: Math.cos(theta) * r, y: Math.sin(theta) * r };
-      const spawnPos = V2.add(playerPos, offset);
+      const orb = this._pool.acquire();
+      if (!orb) break;
 
-      this._spawnProjectile({
-        motionType: 'stationary',
-        pos: spawnPos,
-        vel: V2.zero(),
-        angle: 0,
-        radius: this.effectiveRadius,
-        damage: this.effectiveDamage,
-        pierce: -1,
-        lifetime: 0.6,
-        zoneRadius: this.effectiveRadius,
-        tickRate: 0.1,
-        tickTimer: 0.1,
-        tickDamage: this.effectiveDamage,
-        spriteKey: meta.key,
-        frameIndex: 0,
-        frameInterval: 0.05,
-        scale: 0.8 + Math.random() * 0.6,
-      });
-
-      this._vfx.spawn({
-        type: 'fire_burst',
-        pos: spawnPos,
-        scale: 1.0 + this.level * 0.2,
-      });
+      orb.mesh.position.copyFrom(origin);
+      orb.mesh.position.y = 1.2;
+      orb.mesh.material = this._material;
+      orb.radius = 3.5 * this._stats.areaSize;
+      orb.speed = this._stats.projectileSpeed;
+      orb.maxLife = this._stats.duration;
+      orb.axisOffset = (Math.PI * 2 * i) / count;
+      orb.damage = this._stats.baseDamage;
     }
-
-    this._bridge.pushEnemies(playerPos, this.effectiveRange * 1.5, 200, 0.16);
   }
 
-  private _updateBursts(dt: number): void {
-    const meta = AssetAtlas.necroticEruption;
-    this._pool.forEachActive((proj) => {
-      if (proj.weaponKey !== this.config.key) return;
-      if (proj.motionType !== 'stationary') return;
+  protected _updateActive(dt: number): void {
+    const origin = this._player.position;
 
-      proj.lifetime -= dt;
-      this._updateProjectileFrame(proj, dt, meta);
-
-      proj.tickTimer -= dt;
-      if (proj.tickTimer <= 0) {
-        proj.tickTimer = proj.tickRate;
-        this._bridge.applyAreaDamage(proj.pos, proj.zoneRadius, proj.tickDamage, this.config.key);
-        this._vfx.spawnBurst(proj.pos, 'fire_burst', 2, proj.zoneRadius * 0.5);
+    for (const o of this._pool.getActive()) {
+      o.life += dt;
+      if (o.life >= o.maxLife) {
+        this._pool.release(o);
+        continue;
       }
 
-      if (proj.lifetime <= 0) {
-        proj.active = false;
-        this._pool.release(proj);
+      // Angular equation: orbit around player
+      o.angle += o.speed * dt;
+      const x = origin.x + Math.cos(o.angle + o.axisOffset) * o.radius;
+      const z = origin.z + Math.sin(o.angle + o.axisOffset) * o.radius;
+      o.mesh.position.x = x;
+      o.mesh.position.z = z;
+      o.mesh.rotation.y = -o.angle;
+
+      // Collision sweep
+      const enemies = this._bridge.queryRadius(x, z, 1.5);
+      for (const idx of enemies) {
+        const epos = this._bridge.getEnemyPosition(idx);
+        if (!epos) continue;
+        const dx = epos.x - x;
+        const dz = epos.y - z;
+        if (dx * dx + dz * dz < 2.0) {
+          const roll = this._rollDamage();
+          this._damageEnemy(idx, roll.damage, roll.isCrit);
+        }
       }
-    });
+    }
+  }
+
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.6 BLOOD SIPHON — Life Drain Vortex
-// ───────────────────────────────────────────────────────────────────────────────
+/* -------------------------------------------------------------------------- */
+/*  3. ZEALOT'S CHAIN -- Lashing chain that extends and retracts               */
+/* -------------------------------------------------------------------------- */
 
-export class BloodSiphon extends BaseActiveWeapon {
-  private _vortex: IProjectile | null = null;
+export class ZealotsChain extends BaseWeapon {
+  private readonly _pool: ProjectilePool;
+  private _material: StandardMaterial;
 
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._updateVortex(playerPos, dt);
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("zealots_chain", scene, vfx, player, bridge);
+    this._pool = new ProjectilePool(scene, 64);
+    this._material = new StandardMaterial("chain_mat", scene);
+    this._material.diffuseColor = new Color3(0.7, 0.5, 0.1);
+    this._material.emissiveColor = new Color3(0.3, 0.2, 0.0);
   }
 
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    if (this._vortex?.active) return;
+  protected _fire(): void {
+    const origin = this._player.position;
+    const targetIdx = this._findNearest(origin, 20);
+    if (targetIdx < 0) return;
 
-    const meta = AssetAtlas.bloodVortex;
-    this._vortex = this._spawnProjectile({
-      motionType: 'stationary',
-      pos: { ...playerPos },
-      vel: V2.zero(),
-      angle: 0,
-      radius: this.effectiveRadius,
-      damage: 0,
-      pierce: -1,
-      lifetime: this.effectiveDuration,
-      zoneRadius: this.effectiveRange,
-      tickRate: 0.25,
-      tickTimer: 0.25,
-      tickDamage: this.effectiveDamage * 0.4,
-      spriteKey: meta.key,
-      frameIndex: 0,
-      frameInterval: 0.04,
-      scale: 1 + this.level * 0.2,
-    });
+    const tp = this._bridge.getEnemyPosition(targetIdx)!;
+    const dir = new Vector3(tp.x - origin.x, 0, tp.y - origin.z);
+    const dist = dir.length();
+    dir.normalize();
 
-    this._vfx.spawn({ type: 'rift_open', pos: playerPos, scale: 1.5 });
+    const proj = this._pool.acquire();
+    if (!proj) return;
+
+    proj.mesh.position.copyFrom(origin);
+    proj.mesh.position.y = 1.0;
+    proj.mesh.material = this._material;
+    proj.mesh.scaling.setAll(1);
+
+    const maxReach = Math.min(dist, 12 * this._stats.areaSize);
+    const speed = this._stats.projectileSpeed;
+
+    // Custom update: extend then retract
+    let phase: "out" | "back" = "out";
+    let traveled = 0;
+
+    proj.onUpdate = (dt, p) => {
+      if (phase === "out") {
+        const step = speed * dt;
+        traveled += step;
+        p.mesh.position.addInPlace(dir.scale(step));
+        p.mesh.lookAt(p.mesh.position.add(dir));
+
+        if (traveled >= maxReach) {
+          phase = "back";
+        }
+
+        // Damage during extension
+        const enemies = this._bridge.queryRadius(p.mesh.position.x, p.mesh.position.z, 1.5);
+        for (const idx of enemies) {
+          if (p.hitMask.has(idx)) continue;
+          const epos = this._bridge.getEnemyPosition(idx);
+          if (!epos) continue;
+          const dx = epos.x - p.mesh.position.x;
+          const dz = epos.y - p.mesh.position.z;
+          if (dx * dx + dz * dz < 1.5) {
+            p.hitMask.add(idx);
+            const roll = this._rollDamage();
+            this._damageEnemy(idx, roll.damage, roll.isCrit);
+            this._spawnVFX("blood_spray", p.mesh.position, 5);
+          }
+        }
+      } else {
+        // Retract toward player
+        const toPlayer = origin.subtract(p.mesh.position);
+        toPlayer.y = 0;
+        const d = toPlayer.length();
+        if (d < 0.5) {
+          this._pool.release(p);
+          return;
+        }
+        toPlayer.normalize();
+        p.mesh.position.addInPlace(toPlayer.scale(speed * 1.5 * dt));
+        p.mesh.lookAt(p.mesh.position.add(toPlayer));
+      }
+    };
   }
 
-  private _updateVortex(playerPos: Vec2, dt: number): void {
-    if (!this._vortex?.active) { this._vortex = null; return; }
-    const v = this._vortex;
-    const meta = AssetAtlas.bloodVortex;
-
-    v.pos = { ...playerPos };
-    v.lifetime -= dt;
-    this._updateProjectileFrame(v, dt, meta);
-
-    this._bridge.pullEnemies(v.pos, v.zoneRadius, 80 + this.level * 20, dt);
-
-    v.tickTimer -= dt;
-    if (v.tickTimer <= 0) {
-      v.tickTimer = v.tickRate;
-      const killed = this._bridge.applyAreaDamage(v.pos, v.zoneRadius, v.tickDamage, this.config.key);
-      const healAmount = v.tickDamage * 0.2 * (killed.length + 3);
-      // Heal event dispatched via WeaponManager event bus
+  protected _updateActive(dt: number): void {
+    for (const p of this._pool.getActive()) {
+      p.life += dt;
+      if (p.onUpdate) p.onUpdate(dt, p);
+      if (p.life > 3) this._pool.release(p);
     }
+  }
 
-    if (v.lifetime <= 0) {
-      this._vfx.spawn({ type: 'rift_close', pos: v.pos, scale: 1.2 });
-      v.active = false;
-      this._pool.release(v);
-      this._vortex = null;
-    }
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.7 ABYSSAL RIFT — Portal / Suction Vortex
-// ───────────────────────────────────────────────────────────────────────────────
+/* -------------------------------------------------------------------------- */
+/*  4. UNHOLY ORBIT -- Dark orbiting spheres that damage on contact            */
+/* -------------------------------------------------------------------------- */
 
-export class AbyssalRift extends BaseActiveWeapon {
-  private _rift: IProjectile | null = null;
+export class UnholyOrbit extends BaseWeapon {
+  private readonly _pool: OrbitalPool;
+  private _material: StandardMaterial;
 
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._updateRift(playerPos, dt);
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("unholy_orbit", scene, vfx, player, bridge);
+    this._pool = new OrbitalPool(scene, MAX_ORBITALS);
+    this._material = new StandardMaterial("unholy_mat", scene);
+    this._material.diffuseColor = new Color3(0.2, 0.0, 0.4);
+    this._material.emissiveColor = new Color3(0.4, 0.0, 0.6);
+    this._material.alpha = 0.9;
   }
 
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    if (this._rift?.active) return;
-
-    const meta = AssetAtlas.bloodVortex;
-    this._rift = this._spawnProjectile({
-      motionType: 'stationary',
-      pos: { ...playerPos },
-      vel: V2.zero(),
-      angle: 0,
-      radius: this.effectiveRadius,
-      pierce: -1,
-      lifetime: this.effectiveDuration,
-      zoneRadius: this.effectiveRange,
-      tickRate: 0.3,
-      tickTimer: 0.3,
-      tickDamage: this.effectiveDamage * 0.5,
-      spriteKey: meta.key,
-      frameIndex: 0,
-      frameInterval: 0.05,
-      scale: 1.2 + this.level * 0.25,
-      opacity: 0.85,
-    });
-
-    this._vfx.spawn({ type: 'rift_open', pos: playerPos, scale: 2.0 });
-  }
-
-  private _updateRift(playerPos: Vec2, dt: number): void {
-    if (!this._rift?.active) { this._rift = null; return; }
-    const r = this._rift;
-    const meta = AssetAtlas.bloodVortex;
-
-    r.pos = { ...playerPos };
-    r.lifetime -= dt;
-    this._updateProjectileFrame(r, dt, meta);
-
-    this._bridge.pullEnemies(r.pos, r.zoneRadius, 150 + this.level * 30, dt);
-
-    r.tickTimer -= dt;
-    if (r.tickTimer <= 0) {
-      r.tickTimer = r.tickRate;
-      this._bridge.applyDOT(r.pos, r.zoneRadius, r.tickDamage, 1.0, this.config.key);
-      this._vfx.spawnBurst(r.pos, 'blood_spray', 3, r.zoneRadius * 0.4);
-    }
-
-    if (r.lifetime <= 0) {
-      this._vfx.spawn({ type: 'rift_close', pos: r.pos, scale: 1.8 });
-      r.active = false;
-      this._pool.release(r);
-      this._rift = null;
-    }
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.8 FONT OF TORMENT — Ground DOT Zone (Persistent Burning Carpet)
-// ───────────────────────────────────────────────────────────────────────────────
-
-export class FontOfTorment extends BaseActiveWeapon {
-  private _zones: IProjectile[] = [];
-
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._updateZones(dt);
-  }
-
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const meta = AssetAtlas.fireCarpet;
-
+  protected _fire(): void {
+    const count = this._stats.count;
     for (let i = 0; i < count; i++) {
-      const r = Math.sqrt(Math.random()) * this.effectiveRange * 0.8;
-      const theta = Math.random() * Math.PI * 2;
-      const offset = { x: Math.cos(theta) * r, y: Math.sin(theta) * r };
-      const spawnPos = V2.add(playerPos, offset);
-
-      const p = this._spawnProjectile({
-        motionType: 'stationary',
-        pos: spawnPos,
-        vel: V2.zero(),
-        angle: Math.random() * Math.PI * 2,
-        radius: this.effectiveRadius,
-        damage: 0,
-        pierce: -1,
-        lifetime: this.effectiveDuration,
-        zoneRadius: this.effectiveRadius,
-        tickRate: 0.5,
-        tickTimer: 0.1,
-        tickDamage: this.effectiveDamage * 0.6,
-        spriteKey: meta.key,
-        frameIndex: M.randInt(0, meta.totalFrames - 1),
-        frameInterval: 0.08,
-        scale: 0.9 + Math.random() * 0.4,
-      });
-      this._zones.push(p);
+      const orb = this._pool.acquire();
+      if (!orb) break;
+      orb.radius = 4.0 * this._stats.areaSize;
+      orb.speed = this._stats.projectileSpeed;
+      orb.maxLife = this._stats.duration;
+      orb.axisOffset = (Math.PI * 2 * i) / count;
+      orb.damage = this._stats.baseDamage;
+      orb.mesh.material = this._material;
+      orb.mesh.scaling.setAll(1.5);
     }
-
-    this._vfx.spawn({ type: 'fire_burst', pos: playerPos, scale: 1.0 });
   }
 
-  private _updateZones(dt: number): void {
-    const meta = AssetAtlas.fireCarpet;
-    this._zones = this._zones.filter(z => z.active);
-
-    for (const z of this._zones) {
-      z.lifetime -= dt;
-      this._updateProjectileFrame(z, dt, meta);
-
-      z.tickTimer -= dt;
-      if (z.tickTimer <= 0) {
-        z.tickTimer = z.tickRate;
-        this._bridge.applyAreaDamage(z.pos, z.zoneRadius, z.tickDamage, this.config.key);
-        this._vfx.spawnBurst(z.pos, 'fire_burst', 1, z.zoneRadius * 0.3);
+  protected _updateActive(dt: number): void {
+    const origin = this._player.position;
+    for (const o of this._pool.getActive()) {
+      o.life += dt;
+      if (o.life >= o.maxLife) {
+        this._pool.release(o);
+        continue;
       }
+      o.angle += o.speed * dt;
+      const x = origin.x + Math.cos(o.angle + o.axisOffset) * o.radius;
+      const z = origin.z + Math.sin(o.angle + o.axisOffset) * o.radius;
+      o.mesh.position.set(x, 1.5, z);
 
-      z.opacity = M.clamp(z.lifetime / 0.5, 0, 1);
+      // Vertical bobbing via sin wave for unholy feel
+      o.mesh.position.y = 1.5 + Math.sin(o.life * 3 + o.axisOffset) * 0.5;
 
-      if (z.lifetime <= 0) {
-        z.active = false;
+      const enemies = this._bridge.queryRadius(x, z, 2.0);
+      for (const idx of enemies) {
+        const epos = this._bridge.getEnemyPosition(idx);
+        if (!epos) continue;
+        const dx = epos.x - x;
+        const dz = epos.y - z;
+        if (dx * dx + dz * dz < 2.5) {
+          const roll = this._rollDamage();
+          this._damageEnemy(idx, roll.damage, roll.isCrit);
+          this._spawnVFX("void_glow", o.mesh.position, 4);
+        }
+      }
+    }
+  }
+
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  5. GRAVE BURST -- Explosive ground eruption                                */
+/* -------------------------------------------------------------------------- */
+
+export class GraveBurst extends BaseWeapon {
+  private readonly _pool: ZonePool;
+  private _material: StandardMaterial;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("grave_burst", scene, vfx, player, bridge);
+    this._pool = new ZonePool(scene, MAX_AOE_ZONES);
+    this._material = new StandardMaterial("grave_mat", scene);
+    this._material.diffuseColor = new Color3(0.3, 0.25, 0.2);
+    this._material.emissiveColor = new Color3(0.1, 0.08, 0.05);
+    this._material.alpha = 0.6;
+  }
+
+  protected _fire(): void {
+    const origin = this._player.position;
+    const targetIdx = this._findNearest(origin, 18);
+    let center: Vector3;
+    if (targetIdx >= 0) {
+      const tp = this._bridge.getEnemyPosition(targetIdx)!;
+      center = new Vector3(tp.x, 0.1, tp.y);
+    } else {
+      const angle = Math.random() * Math.PI * 2;
+      center = new Vector3(origin.x + Math.cos(angle) * 5, 0.1, origin.z + Math.sin(angle) * 5);
+    }
+
+    const zone = this._pool.acquire();
+    if (!zone) return;
+
+    zone.mesh.position.copyFrom(center);
+    zone.mesh.material = this._material;
+    zone.radius = 4.0 * this._stats.areaSize;
+    zone.maxLife = this._stats.duration;
+    zone.damage = this._stats.baseDamage;
+    zone.mesh.scaling.setAll(zone.radius);
+
+    // Immediate burst damage
+    const enemies = this._bridge.queryRadius(center.x, center.z, zone.radius);
+    for (const idx of enemies) {
+      const roll = this._rollDamage();
+      this._damageEnemy(idx, roll.damage, roll.isCrit);
+    }
+    this._spawnVFX("blood_spray", center, 20);
+  }
+
+  protected _updateActive(dt: number): void {
+    for (const z of this._pool.getActive()) {
+      z.life += dt;
+      const t = z.life / z.maxLife;
+      // Scale up then fade
+      const scale = z.radius * (1 + Math.sin(t * Math.PI) * 0.3);
+      z.mesh.scaling.setAll(scale);
+      z.mesh.material!.alpha = 0.6 * (1 - t);
+
+      if (z.life >= z.maxLife) {
         this._pool.release(z);
       }
     }
   }
-}
 
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.9 PLAGUE SWARM — Homing Locust Swarm
-// ───────────────────────────────────────────────────────────────────────────────
-
-export class PlagueSwarm extends BaseActiveWeapon {
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._updateSwarm(dt);
-  }
-
-  protected _fire(playerPos: Vec2, _facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const meta = AssetAtlas.locustSwarm;
-    const enemies = this._bridge.getEnemies();
-
-    for (let i = 0; i < count; i++) {
-      let targetId = -1;
-      if (enemies.length > 0) {
-        targetId = enemies[M.randInt(0, enemies.length - 1)].id;
-      }
-
-      const spreadAngle = Math.random() * Math.PI * 2;
-      const dir = { x: Math.cos(spreadAngle), y: Math.sin(spreadAngle) };
-
-      this._spawnProjectile({
-        motionType: 'homing',
-        pos: V2.add(playerPos, V2.mul(dir, 16)),
-        vel: V2.mul(dir, this.effectiveSpeed),
-        angle: spreadAngle,
-        radius: this.effectiveRadius,
-        damage: this.effectiveDamage,
-        pierce: 2 + Math.floor(this.level / 2),
-        lifetime: this.effectiveDuration,
-        turnRate: M.degToRad(180 + this.level * 15),
-        targetId,
-        spriteKey: meta.key,
-        frameIndex: M.randInt(0, 7),
-        frameInterval: 0.04,
-        scale: 0.7 + Math.random() * 0.4,
-      });
-    }
-
-    this._vfx.spawn({ type: 'swarm_cloud', pos: playerPos, scale: 1.2 });
-  }
-
-  private _updateSwarm(dt: number): void {
-    const meta = AssetAtlas.locustSwarm;
-    const enemies = this._bridge.getEnemies();
-    const enemyMap = new Map<number, IEnemy>();
-    for (const e of enemies) enemyMap.set(e.id, e);
-
-    this._pool.forEachActive((proj) => {
-      if (proj.weaponKey !== this.config.key) return;
-      if (proj.motionType !== 'homing') return;
-
-      let target = enemyMap.get(proj.targetId);
-      if (!target || !target.alive) {
-        const nearest = this._bridge.findNearest(proj.pos, 1, this.effectiveRange * 2);
-        if (nearest.length > 0) {
-          target = nearest[0];
-          proj.targetId = target.id;
-        }
-      }
-
-      if (target) {
-        const desired = V2.norm(V2.sub(target.pos, proj.pos));
-        const currentAngle = V2.angle(proj.vel);
-        const desiredAngle = V2.angle(desired);
-        const diff = M.angleDiff(desiredAngle, currentAngle);
-        const steer = M.clamp(diff, -proj.turnRate * dt, proj.turnRate * dt);
-        proj.angle = currentAngle + steer;
-        proj.vel = V2.mul({ x: Math.cos(proj.angle), y: Math.sin(proj.angle) }, proj.speed);
-      }
-
-      proj.pos = V2.add(proj.pos, V2.mul(proj.vel, dt));
-      proj.lifetime -= dt;
-      this._updateProjectileFrame(proj, dt, meta);
-
-      for (const e of enemies) {
-        if (!e.alive) continue;
-        if (M.circleCircle(proj.pos, proj.radius, e.pos, e.radius)) {
-          this._resolveImpact(proj, e);
-          if (!proj.active) break;
-        }
-      }
-
-      if (proj.lifetime <= 0) {
-        proj.active = false;
-        this._pool.release(proj);
-      }
-    });
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// 7.10 GRAVE CHILL — Ice Burst / Cone
-// ───────────────────────────────────────────────────────────────────────────────
+/* -------------------------------------------------------------------------- */
+/*  6. BLOOD SIPHON -- Lifesteal beam connecting to nearest enemies            */
+/* -------------------------------------------------------------------------- */
 
-export class GraveChill extends BaseActiveWeapon {
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    this._evalCooldown(dt, playerPos, facingAngle);
-    this._updateIceProjectiles(dt);
+export class BloodSiphon extends BaseWeapon {
+  private _activeBeams: Array<{
+    targetIndex: number;
+    timer: number;
+    maxTime: number;
+    origin: Vector3;
+  }> = [];
+  private _material: StandardMaterial;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("blood_siphon", scene, vfx, player, bridge);
+    this._material = new StandardMaterial("siphon_mat", scene);
+    this._material.diffuseColor = new Color3(0.6, 0.0, 0.0);
+    this._material.emissiveColor = new Color3(0.8, 0.0, 0.0);
+    this._material.alpha = 0.4;
   }
 
-  protected _fire(playerPos: Vec2, facingAngle: number): void {
-    const count = this.effectiveProjectileCount;
-    const coneArc = M.degToRad(60 + this.level * 8);
-    const meta = AssetAtlas.iceBurst;
+  protected _fire(): void {
+    const origin = this._player.position;
+    const count = this._stats.count;
 
     for (let i = 0; i < count; i++) {
-      const t = count === 1 ? 0 : (i / (count - 1)) - 0.5;
-      const angle = facingAngle + t * coneArc;
-      const dir = { x: Math.cos(angle), y: Math.sin(angle) };
+      const idx = this._findNearest(origin, 12);
+      if (idx < 0) continue;
 
-      this._spawnProjectile({
-        motionType: 'linear',
-        pos: V2.add(playerPos, V2.mul(dir, 14)),
-        vel: V2.mul(dir, this.effectiveSpeed),
-        angle,
-        radius: this.effectiveRadius,
-        damage: this.effectiveDamage,
-        pierce: 3 + this.level,
-        lifetime: this.effectiveDuration,
-        spriteKey: meta.key,
-        frameIndex: M.randInt(0, meta.totalFrames - 1),
-        frameInterval: 0.03,
-        scale: 0.8 + Math.random() * 0.5,
+      // Avoid duplicate targets in same wave
+      if (this._activeBeams.some((b) => b.targetIndex === idx)) continue;
+
+      this._activeBeams.push({
+        targetIndex: idx,
+        timer: 0,
+        maxTime: this._stats.duration,
+        origin: origin.clone(),
       });
+
+      const roll = this._rollDamage();
+      this._damageEnemy(idx, roll.damage, roll.isCrit);
+      // Lifesteal: 20% of damage dealt
+      const heal = roll.damage * 0.2;
+      this._player.heal(heal);
+
+      const tp = this._bridge.getEnemyPosition(idx);
+      if (tp) {
+        const pos = new Vector3(tp.x, 1.2, tp.y);
+        this._spawnVFX("blood_spray", pos, 8);
+      }
+    }
+  }
+
+  protected _updateActive(dt: number): void {
+    const origin = this._player.position;
+    for (let i = this._activeBeams.length - 1; i >= 0; i--) {
+      const beam = this._activeBeams[i];
+      beam.timer += dt;
+      beam.origin.copyFrom(origin);
+
+      // Verify target still alive / in range
+      const tp = this._bridge.getEnemyPosition(beam.targetIndex);
+      if (!tp || beam.timer >= beam.maxTime) {
+        this._activeBeams.splice(i, 1);
+        continue;
+      }
+
+      // Continuous damage tick
+      if (Math.floor(beam.timer * 4) !== Math.floor((beam.timer - dt) * 4)) {
+        const roll = this._rollDamage();
+        this._damageEnemy(beam.targetIndex, roll.damage * 0.5, roll.isCrit);
+        this._player.heal(roll.damage * 0.1);
+      }
+    }
+  }
+
+  public dispose(): void {
+    this._activeBeams.length = 0;
+    this._material.dispose();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  7. ABYSSAL RIFT -- Pull zone that drags enemies inward and damages         */
+/* -------------------------------------------------------------------------- */
+
+export class AbyssalRift extends BaseWeapon {
+  private readonly _pool: ZonePool;
+  private _material: StandardMaterial;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("abyssal_rift", scene, vfx, player, bridge);
+    this._pool = new ZonePool(scene, MAX_AOE_ZONES);
+    this._material = new StandardMaterial("rift_mat", scene);
+    this._material.diffuseColor = new Color3(0.05, 0.0, 0.15);
+    this._material.emissiveColor = new Color3(0.2, 0.0, 0.4);
+    this._material.alpha = 0.7;
+  }
+
+  protected _fire(): void {
+    const origin = this._player.position;
+    const targetIdx = this._findNearest(origin, 20);
+    let center: Vector3;
+    if (targetIdx >= 0) {
+      const tp = this._bridge.getEnemyPosition(targetIdx)!;
+      center = new Vector3(tp.x, 0.2, tp.y);
+    } else {
+      const angle = Math.random() * Math.PI * 2;
+      center = new Vector3(origin.x + Math.cos(angle) * 6, 0.2, origin.z + Math.sin(angle) * 6);
     }
 
-    this._bridge.applyConeDamage(
-      playerPos, facingAngle, coneArc, this.effectiveRange,
-      this.effectiveDamage * 0.3, this.config.key,
+    const zone = this._pool.acquire();
+    if (!zone) return;
+
+    zone.mesh.position.copyFrom(center);
+    zone.mesh.material = this._material;
+    zone.radius = 5.0 * this._stats.areaSize;
+    zone.maxLife = this._stats.duration;
+    zone.damage = this._stats.baseDamage;
+    zone.mesh.scaling.setAll(zone.radius);
+    zone.origin.copyFrom(center);
+  }
+
+  protected _updateActive(dt: number): void {
+    for (const z of this._pool.getActive()) {
+      z.life += dt;
+      z.tickTimer += dt;
+
+      // Rotate zone for vortex feel
+      z.mesh.rotation.z += dt * 2;
+
+      if (z.tickTimer >= z.tickInterval) {
+        z.tickTimer = 0;
+        const enemies = this._bridge.queryRadius(z.origin.x, z.origin.z, z.radius);
+        for (const idx of enemies) {
+          const epos = this._bridge.getEnemyPosition(idx);
+          if (!epos) continue;
+          const dx = z.origin.x - epos.x;
+          const dz = z.origin.z - epos.y;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          if (dist < z.radius && dist > 0.5) {
+            // Pull force (reported to swarm via external impulse if supported,
+            // otherwise just damage). Here we apply damage only; pull is
+            // communicated through an optional callback on the bridge.
+            const roll = this._rollDamage();
+            this._damageEnemy(idx, roll.damage, roll.isCrit);
+          }
+        }
+        this._spawnVFX("void_glow", z.origin, 10);
+      }
+
+      if (z.life >= z.maxLife) {
+        this._pool.release(z);
+      }
+    }
+  }
+
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  8. FONT OF TORMENT -- Persistent damaging fountain underneath player       */
+/* -------------------------------------------------------------------------- */
+
+export class FontOfTorment extends BaseWeapon {
+  private readonly _pool: ZonePool;
+  private _material: StandardMaterial;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("font_of_torment", scene, vfx, player, bridge);
+    this._pool = new ZonePool(scene, MAX_AOE_ZONES);
+    this._material = new StandardMaterial("font_mat", scene);
+    this._material.diffuseColor = new Color3(0.5, 0.0, 0.1);
+    this._material.emissiveColor = new Color3(0.6, 0.0, 0.15);
+    this._material.alpha = 0.5;
+  }
+
+  protected _fire(): void {
+    const zone = this._pool.acquire();
+    if (!zone) return;
+
+    zone.mesh.position.copyFrom(this._player.position);
+    zone.mesh.position.y = 0.1;
+    zone.mesh.material = this._material;
+    zone.radius = 3.5 * this._stats.areaSize;
+    zone.maxLife = this._stats.duration;
+    zone.damage = this._stats.baseDamage;
+    zone.mesh.scaling.setAll(zone.radius);
+    zone.tickInterval = 0.4;
+    zone.origin.copyFrom(this._player.position);
+  }
+
+  protected _updateActive(dt: number): void {
+    for (const z of this._pool.getActive()) {
+      z.life += dt;
+      z.tickTimer += dt;
+
+      // Follow player
+      z.mesh.position.x = this._player.position.x;
+      z.mesh.position.z = this._player.position.z;
+
+      if (z.tickTimer >= z.tickInterval) {
+        z.tickTimer = 0;
+        const enemies = this._bridge.queryRadius(z.mesh.position.x, z.mesh.position.z, z.radius);
+        for (const idx of enemies) {
+          const roll = this._rollDamage();
+          this._damageEnemy(idx, roll.damage, roll.isCrit);
+        }
+        this._spawnVFX("blood_spray", z.mesh.position, 6);
+      }
+
+      if (z.life >= z.maxLife) {
+        this._pool.release(z);
+      }
+    }
+  }
+
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  9. PLAGUE SWARM -- Tracking swarm of diseased projectiles                  */
+/* -------------------------------------------------------------------------- */
+
+export class PlagueSwarm extends BaseWeapon {
+  private readonly _pool: ProjectilePool;
+  private _material: StandardMaterial;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("plague_swarm", scene, vfx, player, bridge);
+    this._pool = new ProjectilePool(scene, MAX_PROJECTILES);
+    this._material = new StandardMaterial("plague_mat", scene);
+    this._material.diffuseColor = new Color3(0.2, 0.5, 0.1);
+    this._material.emissiveColor = new Color3(0.1, 0.3, 0.0);
+  }
+
+  protected _fire(): void {
+    const origin = this._player.position;
+    const count = this._stats.count;
+
+    for (let i = 0; i < count; i++) {
+      const proj = this._pool.acquire();
+      if (!proj) break;
+
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.5;
+      const dir = new Vector3(Math.cos(angle), 0, Math.sin(angle));
+
+      proj.mesh.position.copyFrom(origin);
+      proj.mesh.position.y = 1.0;
+      proj.velocity = dir.scale(this._stats.projectileSpeed * 0.5);
+      proj.maxLife = this._stats.duration;
+      proj.pierce = this._stats.pierce;
+      proj.mesh.material = this._material;
+
+      // Homing update
+      proj.onUpdate = (dt, p) => {
+        const nearest = this._findNearest(p.mesh.position, 15);
+        if (nearest >= 0) {
+          const tp = this._bridge.getEnemyPosition(nearest)!;
+          const desired = new Vector3(tp.x - p.mesh.position.x, 0, tp.y - p.mesh.position.z);
+          desired.normalize();
+          // Steer velocity toward target
+          p.velocity = Vector3.Lerp(p.velocity, desired.scale(this._stats.projectileSpeed), 4 * dt);
+        }
+        p.mesh.lookAt(p.mesh.position.add(p.velocity));
+      };
+    }
+  }
+
+  protected _updateActive(dt: number): void {
+    for (const p of this._pool.getActive()) {
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        this._pool.release(p);
+        continue;
+      }
+
+      if (p.onUpdate) p.onUpdate(dt, p);
+      p.mesh.position.addInPlace(p.velocity.scale(dt));
+
+      const enemies = this._bridge.queryRadius(p.mesh.position.x, p.mesh.position.z, 1.0);
+      for (const idx of enemies) {
+        if (p.hitMask.has(idx)) continue;
+        const epos = this._bridge.getEnemyPosition(idx);
+        if (!epos) continue;
+        const dx = epos.x - p.mesh.position.x;
+        const dz = epos.y - p.mesh.position.z;
+        if (dx * dx + dz * dz < 0.8) {
+          p.hitMask.add(idx);
+          const roll = this._rollDamage();
+          this._damageEnemy(idx, roll.damage, roll.isCrit);
+          if (p.hitMask.size > p.pierce) {
+            this._pool.release(p);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  public dispose(): void {
+    this._pool.dispose();
+    this._material.dispose();
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  10. GRAVE CHILL -- Aura that slows and damages nearby enemies              */
+/* -------------------------------------------------------------------------- */
+
+export class GraveChill extends BaseWeapon {
+  private _pulseTimer: number = 0;
+  private _material: StandardMaterial;
+  private _auraMesh: Mesh;
+
+  constructor(scene: Scene, vfx: ParticleFXPool, player: PlayerController, bridge: EnemyQueryBridge) {
+    super("grave_chill", scene, vfx, player, bridge);
+    this._material = new StandardMaterial("chill_mat", scene);
+    this._material.diffuseColor = new Color3(0.5, 0.8, 0.9);
+    this._material.emissiveColor = new Color3(0.2, 0.5, 0.7);
+    this._material.alpha = 0.25;
+
+    this._auraMesh = MeshBuilder.CreateDisc(
+      "grave_chill_aura",
+      { radius: 1, tessellation: 32 },
+      scene
     );
-    this._bridge.applySlow(playerPos, this.effectiveRange, 0.4 + this.level * 0.05, 2.5, this.config.key);
-
-    this._vfx.spawnBurst(playerPos, 'ice_shatter', 5, 30);
+    this._auraMesh.rotation.x = Math.PI / 2;
+    this._auraMesh.material = this._material;
+    this._auraMesh.isVisible = false;
   }
 
-  private _updateIceProjectiles(dt: number): void {
-    const meta = AssetAtlas.iceBurst;
-    this._pool.forEachActive((proj) => {
-      if (proj.weaponKey !== this.config.key) return;
-      if (proj.motionType !== 'linear') return;
+  protected _fire(): void {
+    // Grave Chill is a passive aura; firing just resets the pulse
+    this._pulseTimer = 0;
+  }
 
-      this._updateLinear(proj, dt);
-      this._updateProjectileFrame(proj, dt, meta);
+  protected _updateActive(dt: number): void {
+    this._pulseTimer += dt;
+    const radius = 5.0 * this._stats.areaSize;
 
-      const enemies = this._bridge.getEnemies();
-      for (const e of enemies) {
-        if (!e.alive) continue;
-        if (M.circleCircle(proj.pos, proj.radius, e.pos, e.radius)) {
-          this._bridge.applySlow(e.pos, e.radius * 3, 0.35, 1.5, this.config.key);
-          this._resolveImpact(proj, e);
-          if (!proj.active) break;
-        }
+    // Visual aura follow
+    this._auraMesh.isVisible = true;
+    this._auraMesh.position.copyFrom(this._player.position);
+    this._auraMesh.position.y = 0.2;
+    this._auraMesh.scaling.setAll(radius);
+
+    // Pulse opacity
+    const pulse = 0.2 + Math.sin(this._pulseTimer * 3) * 0.1;
+    this._material.alpha = pulse;
+
+    if (this._pulseTimer >= this._stats.cooldown) {
+      this._pulseTimer = 0;
+      const origin = this._player.position;
+      const enemies = this._bridge.queryRadius(origin.x, origin.z, radius);
+      for (const idx of enemies) {
+        const roll = this._rollDamage();
+        this._damageEnemy(idx, roll.damage, roll.isCrit);
       }
-    });
+      if (enemies.length > 0) {
+        this._spawnVFX("frost_haze", origin, 8);
+      }
+    }
+  }
+
+  public dispose(): void {
+    this._auraMesh.dispose();
+    this._material.dispose();
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/*  WEAPON MANAGER                                                            */
+/* -------------------------------------------------------------------------- */
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 8: WEAPON CONFIGURATION FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export const WeaponConfigs: Record<string, IWeaponConfig> = {
-  sinnersQuills: {
-    key: 'sinnersQuills',
-    name: "Sinner's Quills",
-    description: 'Fan of cursed daggers hurled in the facing direction.',
-    maxLevel: 8,
-    spriteKey: 'quills',
-    vfxImpact: 'impact_spark',
-    statsPerLevel: [
-      { damage: 12, cooldown: 1.2, projectileCount: 3, speed: 320, range: 500, radius: 10, pierce: 1, duration: 1.2, tickRate: 0, special: 0 },
-      { damage: 16, cooldown: 1.1, projectileCount: 4, speed: 340, range: 520, radius: 11, pierce: 1, duration: 1.3, tickRate: 0, special: 0 },
-      { damage: 20, cooldown: 1.0, projectileCount: 5, speed: 360, range: 540, radius: 12, pierce: 2, duration: 1.4, tickRate: 0, special: 0 },
-      { damage: 26, cooldown: 0.9, projectileCount: 6, speed: 380, range: 560, radius: 13, pierce: 2, duration: 1.5, tickRate: 0, special: 0 },
-      { damage: 32, cooldown: 0.8, projectileCount: 7, speed: 400, range: 580, radius: 14, pierce: 3, duration: 1.6, tickRate: 0, special: 0 },
-      { damage: 40, cooldown: 0.7, projectileCount: 8, speed: 420, range: 600, radius: 15, pierce: 3, duration: 1.7, tickRate: 0, special: 0 },
-      { damage: 50, cooldown: 0.6, projectileCount: 9, speed: 440, range: 620, radius: 16, pierce: 4, duration: 1.8, tickRate: 0, special: 0 },
-      { damage: 65, cooldown: 0.5, projectileCount: 11, speed: 460, range: 650, radius: 18, pierce: 5, duration: 2.0, tickRate: 0, special: 0 },
-    ],
-  },
-  whirlingHalberds: {
-    key: 'whirlingHalberds',
-    name: 'Whirling Halberds',
-    description: 'Massive polearms orbit the player, shredding all who approach.',
-    maxLevel: 8,
-    spriteKey: 'halberds',
-    vfxImpact: 'impact_spark',
-    statsPerLevel: [
-      { damage: 18, cooldown: 4.0, projectileCount: 1, speed: 180, range: 90, radius: 22, pierce: -1, duration: 3.0, tickRate: 0, special: 0 },
-      { damage: 24, cooldown: 3.8, projectileCount: 2, speed: 190, range: 95, radius: 24, pierce: -1, duration: 3.2, tickRate: 0, special: 0 },
-      { damage: 30, cooldown: 3.6, projectileCount: 2, speed: 200, range: 100, radius: 26, pierce: -1, duration: 3.4, tickRate: 0, special: 0 },
-      { damage: 38, cooldown: 3.4, projectileCount: 3, speed: 210, range: 105, radius: 28, pierce: -1, duration: 3.6, tickRate: 0, special: 0 },
-      { damage: 48, cooldown: 3.2, projectileCount: 3, speed: 220, range: 110, radius: 30, pierce: -1, duration: 3.8, tickRate: 0, special: 0 },
-      { damage: 60, cooldown: 3.0, projectileCount: 4, speed: 230, range: 115, radius: 32, pierce: -1, duration: 4.0, tickRate: 0, special: 0 },
-      { damage: 75, cooldown: 2.8, projectileCount: 4, speed: 240, range: 120, radius: 34, pierce: -1, duration: 4.2, tickRate: 0, special: 0 },
-      { damage: 95, cooldown: 2.5, projectileCount: 5, speed: 260, range: 130, radius: 38, pierce: -1, duration: 4.5, tickRate: 0, special: 0 },
-    ],
-  },
-  zealotsChain: {
-    key: 'zealotsChain',
-    name: "Zealot's Chain",
-    description: 'Arcing lightning strikes the nearest foe, chaining to others.',
-    maxLevel: 8,
-    spriteKey: 'lightningArc',
-    vfxImpact: 'lightning_arc',
-    statsPerLevel: [
-      { damage: 25, cooldown: 2.5, projectileCount: 1, speed: 800, range: 350, radius: 14, pierce: -1, duration: 0.3, tickRate: 0, special: 2 },
-      { damage: 32, cooldown: 2.3, projectileCount: 1, speed: 820, range: 370, radius: 15, pierce: -1, duration: 0.3, tickRate: 0, special: 3 },
-      { damage: 40, cooldown: 2.1, projectileCount: 1, speed: 840, range: 390, radius: 16, pierce: -1, duration: 0.3, tickRate: 0, special: 3 },
-      { damage: 50, cooldown: 1.9, projectileCount: 1, speed: 860, range: 410, radius: 17, pierce: -1, duration: 0.3, tickRate: 0, special: 4 },
-      { damage: 62, cooldown: 1.7, projectileCount: 1, speed: 880, range: 430, radius: 18, pierce: -1, duration: 0.3, tickRate: 0, special: 4 },
-      { damage: 78, cooldown: 1.5, projectileCount: 1, speed: 900, range: 450, radius: 19, pierce: -1, duration: 0.3, tickRate: 0, special: 5 },
-      { damage: 95, cooldown: 1.3, projectileCount: 1, speed: 920, range: 470, radius: 20, pierce: -1, duration: 0.3, tickRate: 0, special: 5 },
-      { damage: 120, cooldown: 1.1, projectileCount: 1, speed: 950, range: 500, radius: 22, pierce: -1, duration: 0.3, tickRate: 0, special: 6 },
-    ],
-  },
-  unholyOrbit: {
-    key: 'unholyOrbit',
-    name: 'Unholy Orbit',
-    description: 'A cage of bone ribs spins around the player, repelling enemies.',
-    maxLevel: 8,
-    spriteKey: 'boneCage',
-    vfxImpact: 'bone_shatter',
-    statsPerLevel: [
-      { damage: 22, cooldown: 4.5, projectileCount: 1, speed: 160, range: 100, radius: 28, pierce: -1, duration: 3.5, tickRate: 0, special: 0 },
-      { damage: 28, cooldown: 4.2, projectileCount: 2, speed: 170, range: 105, radius: 30, pierce: -1, duration: 3.7, tickRate: 0, special: 0 },
-      { damage: 36, cooldown: 3.9, projectileCount: 2, speed: 180, range: 110, radius: 32, pierce: -1, duration: 3.9, tickRate: 0, special: 0 },
-      { damage: 45, cooldown: 3.6, projectileCount: 3, speed: 190, range: 115, radius: 34, pierce: -1, duration: 4.1, tickRate: 0, special: 0 },
-      { damage: 56, cooldown: 3.3, projectileCount: 3, speed: 200, range: 120, radius: 36, pierce: -1, duration: 4.3, tickRate: 0, special: 0 },
-      { damage: 70, cooldown: 3.0, projectileCount: 4, speed: 210, range: 125, radius: 38, pierce: -1, duration: 4.5, tickRate: 0, special: 0 },
-      { damage: 88, cooldown: 2.7, projectileCount: 4, speed: 220, range: 130, radius: 40, pierce: -1, duration: 4.7, tickRate: 0, special: 0 },
-      { damage: 110, cooldown: 2.4, projectileCount: 5, speed: 240, range: 140, radius: 44, pierce: -1, duration: 5.0, tickRate: 0, special: 0 },
-    ],
-  },
-  graveBurst: {
-    key: 'graveBurst',
-    name: 'Grave Burst',
-    description: 'Necrotic eruptions burst from the ground around the player.',
-    maxLevel: 8,
-    spriteKey: 'necroticEruption',
-    vfxImpact: 'fire_burst',
-    statsPerLevel: [
-      { damage: 30, cooldown: 3.0, projectileCount: 3, speed: 0, range: 180, radius: 35, pierce: -1, duration: 0.6, tickRate: 0.1, special: 0 },
-      { damage: 38, cooldown: 2.8, projectileCount: 4, speed: 0, range: 190, radius: 38, pierce: -1, duration: 0.6, tickRate: 0.1, special: 0 },
-      { damage: 48, cooldown: 2.6, projectileCount: 5, speed: 0, range: 200, radius: 40, pierce: -1, duration: 0.7, tickRate: 0.1, special: 0 },
-      { damage: 60, cooldown: 2.4, projectileCount: 6, speed: 0, range: 210, radius: 42, pierce: -1, duration: 0.7, tickRate: 0.1, special: 0 },
-      { damage: 75, cooldown: 2.2, projectileCount: 7, speed: 0, range: 220, radius: 44, pierce: -1, duration: 0.8, tickRate: 0.1, special: 0 },
-      { damage: 92, cooldown: 2.0, projectileCount: 8, speed: 0, range: 230, radius: 46, pierce: -1, duration: 0.8, tickRate: 0.1, special: 0 },
-      { damage: 115, cooldown: 1.8, projectileCount: 9, speed: 0, range: 240, radius: 48, pierce: -1, duration: 0.9, tickRate: 0.1, special: 0 },
-      { damage: 145, cooldown: 1.6, projectileCount: 11, speed: 0, range: 260, radius: 52, pierce: -1, duration: 1.0, tickRate: 0.1, special: 0 },
-    ],
-  },
-  bloodSiphon: {
-    key: 'bloodSiphon',
-    name: 'Blood Siphon',
-    description: 'A vortex of crimson essence drains life from nearby foes.',
-    maxLevel: 8,
-    spriteKey: 'bloodVortex',
-    vfxImpact: 'blood_spray',
-    statsPerLevel: [
-      { damage: 8, cooldown: 5.0, projectileCount: 1, speed: 0, range: 140, radius: 20, pierce: -1, duration: 3.0, tickRate: 0.25, special: 0 },
-      { damage: 10, cooldown: 4.7, projectileCount: 1, speed: 0, range: 150, radius: 22, pierce: -1, duration: 3.2, tickRate: 0.25, special: 0 },
-      { damage: 13, cooldown: 4.4, projectileCount: 1, speed: 0, range: 160, radius: 24, pierce: -1, duration: 3.4, tickRate: 0.25, special: 0 },
-      { damage: 16, cooldown: 4.1, projectileCount: 1, speed: 0, range: 170, radius: 26, pierce: -1, duration: 3.6, tickRate: 0.25, special: 0 },
-      { damage: 20, cooldown: 3.8, projectileCount: 1, speed: 0, range: 180, radius: 28, pierce: -1, duration: 3.8, tickRate: 0.25, special: 0 },
-      { damage: 25, cooldown: 3.5, projectileCount: 1, speed: 0, range: 190, radius: 30, pierce: -1, duration: 4.0, tickRate: 0.25, special: 0 },
-      { damage: 32, cooldown: 3.2, projectileCount: 1, speed: 0, range: 200, radius: 32, pierce: -1, duration: 4.2, tickRate: 0.25, special: 0 },
-      { damage: 40, cooldown: 2.8, projectileCount: 1, speed: 0, range: 220, radius: 36, pierce: -1, duration: 4.5, tickRate: 0.25, special: 0 },
-    ],
-  },
-  abyssalRift: {
-    key: 'abyssalRift',
-    name: 'Abyssal Rift',
-    description: 'Opens a dark portal that pulls enemies in and devours them.',
-    maxLevel: 8,
-    spriteKey: 'bloodVortex',
-    vfxImpact: 'blood_spray',
-    statsPerLevel: [
-      { damage: 10, cooldown: 5.5, projectileCount: 1, speed: 0, range: 160, radius: 24, pierce: -1, duration: 3.5, tickRate: 0.3, special: 0 },
-      { damage: 13, cooldown: 5.1, projectileCount: 1, speed: 0, range: 170, radius: 26, pierce: -1, duration: 3.7, tickRate: 0.3, special: 0 },
-      { damage: 16, cooldown: 4.7, projectileCount: 1, speed: 0, range: 180, radius: 28, pierce: -1, duration: 3.9, tickRate: 0.3, special: 0 },
-      { damage: 20, cooldown: 4.3, projectileCount: 1, speed: 0, range: 190, radius: 30, pierce: -1, duration: 4.1, tickRate: 0.3, special: 0 },
-      { damage: 25, cooldown: 3.9, projectileCount: 1, speed: 0, range: 200, radius: 32, pierce: -1, duration: 4.3, tickRate: 0.3, special: 0 },
-      { damage: 32, cooldown: 3.5, projectileCount: 1, speed: 0, range: 210, radius: 34, pierce: -1, duration: 4.5, tickRate: 0.3, special: 0 },
-      { damage: 40, cooldown: 3.1, projectileCount: 1, speed: 0, range: 220, radius: 36, pierce: -1, duration: 4.7, tickRate: 0.3, special: 0 },
-      { damage: 50, cooldown: 2.7, projectileCount: 1, speed: 0, range: 240, radius: 40, pierce: -1, duration: 5.0, tickRate: 0.3, special: 0 },
-    ],
-  },
-  fontOfTorment: {
-    key: 'fontOfTorment',
-    name: 'Font of Torment',
-    description: 'Scorches the earth with blood-red flame carpets.',
-    maxLevel: 8,
-    spriteKey: 'fireCarpet',
-    vfxImpact: 'fire_burst',
-    statsPerLevel: [
-      { damage: 6, cooldown: 4.0, projectileCount: 2, speed: 0, range: 160, radius: 40, pierce: -1, duration: 4.0, tickRate: 0.5, special: 0 },
-      { damage: 8, cooldown: 3.7, projectileCount: 3, speed: 0, range: 170, radius: 42, pierce: -1, duration: 4.2, tickRate: 0.5, special: 0 },
-      { damage: 10, cooldown: 3.4, projectileCount: 3, speed: 0, range: 180, radius: 44, pierce: -1, duration: 4.4, tickRate: 0.5, special: 0 },
-      { damage: 13, cooldown: 3.1, projectileCount: 4, speed: 0, range: 190, radius: 46, pierce: -1, duration: 4.6, tickRate: 0.5, special: 0 },
-      { damage: 16, cooldown: 2.8, projectileCount: 4, speed: 0, range: 200, radius: 48, pierce: -1, duration: 4.8, tickRate: 0.5, special: 0 },
-      { damage: 20, cooldown: 2.5, projectileCount: 5, speed: 0, range: 210, radius: 50, pierce: -1, duration: 5.0, tickRate: 0.5, special: 0 },
-      { damage: 25, cooldown: 2.2, projectileCount: 5, speed: 0, range: 220, radius: 52, pierce: -1, duration: 5.2, tickRate: 0.5, special: 0 },
-      { damage: 32, cooldown: 1.9, projectileCount: 6, speed: 0, range: 240, radius: 56, pierce: -1, duration: 5.5, tickRate: 0.5, special: 0 },
-    ],
-  },
-  plagueSwarm: {
-    key: 'plagueSwarm',
-    name: 'Plague Swarm',
-    description: 'A cloud of ravenous locusts seeks and devours enemies.',
-    maxLevel: 8,
-    spriteKey: 'locustSwarm',
-    vfxImpact: 'swarm_cloud',
-    statsPerLevel: [
-      { damage: 9, cooldown: 2.0, projectileCount: 5, speed: 220, range: 450, radius: 10, pierce: 2, duration: 3.0, tickRate: 0, special: 0 },
-      { damage: 12, cooldown: 1.9, projectileCount: 6, speed: 230, range: 470, radius: 11, pierce: 2, duration: 3.2, tickRate: 0, special: 0 },
-      { damage: 15, cooldown: 1.8, projectileCount: 7, speed: 240, range: 490, radius: 12, pierce: 3, duration: 3.4, tickRate: 0, special: 0 },
-      { damage: 19, cooldown: 1.7, projectileCount: 8, speed: 250, range: 510, radius: 13, pierce: 3, duration: 3.6, tickRate: 0, special: 0 },
-      { damage: 24, cooldown: 1.6, projectileCount: 9, speed: 260, range: 530, radius: 14, pierce: 4, duration: 3.8, tickRate: 0, special: 0 },
-      { damage: 30, cooldown: 1.5, projectileCount: 10, speed: 270, range: 550, radius: 15, pierce: 4, duration: 4.0, tickRate: 0, special: 0 },
-      { damage: 38, cooldown: 1.4, projectileCount: 11, speed: 280, range: 570, radius: 16, pierce: 5, duration: 4.2, tickRate: 0, special: 0 },
-      { damage: 48, cooldown: 1.2, projectileCount: 13, speed: 300, range: 600, radius: 18, pierce: 6, duration: 4.5, tickRate: 0, special: 0 },
-    ],
-  },
-  graveChill: {
-    key: 'graveChill',
-    name: 'Grave Chill',
-    description: 'Unleashes a cone of razor-sharp frost that slows enemies.',
-    maxLevel: 8,
-    spriteKey: 'iceBurst',
-    vfxImpact: 'ice_shatter',
-    statsPerLevel: [
-      { damage: 18, cooldown: 2.2, projectileCount: 4, speed: 280, range: 320, radius: 14, pierce: 3, duration: 1.0, tickRate: 0, special: 0 },
-      { damage: 24, cooldown: 2.0, projectileCount: 5, speed: 300, range: 340, radius: 15, pierce: 4, duration: 1.1, tickRate: 0, special: 0 },
-      { damage: 30, cooldown: 1.8, projectileCount: 6, speed: 320, range: 360, radius: 16, pierce: 4, duration: 1.2, tickRate: 0, special: 0 },
-      { damage: 38, cooldown: 1.7, projectileCount: 7, speed: 340, range: 380, radius: 17, pierce: 5, duration: 1.3, tickRate: 0, special: 0 },
-      { damage: 48, cooldown: 1.6, projectileCount: 8, speed: 360, range: 400, radius: 18, pierce: 5, duration: 1.4, tickRate: 0, special: 0 },
-      { damage: 60, cooldown: 1.5, projectileCount: 9, speed: 380, range: 420, radius: 19, pierce: 6, duration: 1.5, tickRate: 0, special: 0 },
-      { damage: 75, cooldown: 1.4, projectileCount: 10, speed: 400, range: 440, radius: 20, pierce: 6, duration: 1.6, tickRate: 0, special: 0 },
-      { damage: 95, cooldown: 1.2, projectileCount: 12, speed: 430, range: 470, radius: 22, pierce: 7, duration: 1.8, tickRate: 0, special: 0 },
-    ],
-  },
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 9: WEAPON MANAGER — ORCHESTRATOR
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface IWeaponManagerOptions {
-  /** Initial capacity of the projectile object pool. */
-  projectilePoolCapacity?: number;
-  /** Max projectiles allowed active at once (hard cap for safety). */
-  maxActiveProjectiles?: number;
-}
-
-export type WeaponEventType =
-  | 'weaponFired'
-  | 'projectileSpawned'
-  | 'projectileDestroyed'
-  | 'enemyKilled'
-  | 'playerHealed'
-  | 'weaponLeveledUp';
-
-export interface IWeaponEvent {
-  type: WeaponEventType;
-  weaponKey?: string;
-  projectileId?: number;
-  enemyId?: number;
-  position?: Vec2;
-  amount?: number;
-}
-
-type EventCallback = (evt: IWeaponEvent) => void;
-
-/**
- * WeaponManager is the single entry-point for all active weapon logic.
- * It owns the projectile object pool, maintains the weapon registry,
- * evaluates independent cooldown loops every frame, and bridges
- * collision results to the external enemy system + VFX pool.
- */
 export class WeaponManager {
-  private _weapons = new Map<string, BaseActiveWeapon>();
-  private _projectilePool: ObjectPool<IProjectile>;
-  private _bridge: ICollisionBridge;
-  private _vfx: IVFXPool;
-  private _options: Required<IWeaponManagerOptions>;
-  private _eventListeners = new Map<WeaponEventType, EventCallback[]>();
+  private readonly _scene: Scene;
+  private readonly _vfx: ParticleFXPool;
+  private readonly _player: PlayerController;
+  private readonly _bridge: EnemyQueryBridge;
+  private readonly _weapons: Map<string, BaseWeapon> = new Map();
+  private _combatText: CombatTextFn | null = null;
+  private _observer: any;
 
   constructor(
-    bridge: ICollisionBridge,
-    vfx: IVFXPool,
-    options: IWeaponManagerOptions = {},
+    scene: Scene,
+    vfx: ParticleFXPool,
+    player: PlayerController,
+    bridge: EnemyQueryBridge
   ) {
-    this._bridge = bridge;
+    this._scene = scene;
     this._vfx = vfx;
-    this._options = {
-      projectilePoolCapacity: options.projectilePoolCapacity ?? 512,
-      maxActiveProjectiles: options.maxActiveProjectiles ?? 1024,
-    };
-    this._projectilePool = new ObjectPool(
-      createProjectile,
-      this._options.projectilePoolCapacity,
-    );
-  }
+    this._player = player;
+    this._bridge = bridge;
 
-  // ── Weapon Lifecycle ──────────────────────────────────────────────────────
-
-  register(key: string, weapon: BaseActiveWeapon): void {
-    this._weapons.set(key, weapon);
-  }
-
-  unlock(key: string): boolean {
-    const w = this._weapons.get(key);
-    if (!w) return false;
-    w.isUnlocked = true;
-    w.cooldownTimer = 0; // Fire immediately on unlock
-    return true;
-  }
-
-  lock(key: string): boolean {
-    const w = this._weapons.get(key);
-    if (!w) return false;
-    w.isUnlocked = false;
-    return true;
-  }
-
-  levelUp(key: string): boolean {
-    const w = this._weapons.get(key);
-    if (!w || w.level >= w.config.maxLevel) return false;
-    w.level++;
-    this._emit({ type: 'weaponLeveledUp', weaponKey: key });
-    return true;
-  }
-
-  getWeapon(key: string): BaseActiveWeapon | undefined {
-    return this._weapons.get(key);
-  }
-
-  getAllWeapons(): BaseActiveWeapon[] {
-    return Array.from(this._weapons.values());
-  }
-
-  getActiveWeapons(): BaseActiveWeapon[] {
-    return Array.from(this._weapons.values()).filter(w => w.isUnlocked);
-  }
-
-  // ── Passive Stat Modifiers ─────────────────────────────────────────────────
-
-  applyGlobalBuff(opts: {
-    damageMult?: number;
-    cooldownMult?: number;
-    areaMult?: number;
-    speedMult?: number;
-    durationMult?: number;
-    projectileCountBonus?: number;
-  }): void {
-    for (const w of this._weapons.values()) {
-      if (opts.damageMult !== undefined) w.damageMult *= opts.damageMult;
-      if (opts.cooldownMult !== undefined) w.cooldownMult *= opts.cooldownMult;
-      if (opts.areaMult !== undefined) w.areaMult *= opts.areaMult;
-      if (opts.speedMult !== undefined) w.speedMult *= opts.speedMult;
-      if (opts.durationMult !== undefined) w.durationMult *= opts.durationMult;
-      if (opts.projectileCountBonus !== undefined) w.projectileCountBonus += opts.projectileCountBonus;
-    }
-  }
-
-  // ── Per-Frame Update ──────────────────────────────────────────────────────
-
-  /**
-   * Main update loop. Call once per frame from your game loop.
-   * @param dt Delta time in seconds.
-   * @param playerPos Current player world position.
-   * @param facingAngle Player facing angle in radians.
-   */
-  update(dt: number, playerPos: Vec2, facingAngle: number): void {
-    // 1. Update all active weapons (cooldown eval + weapon-specific state)
-    for (const weapon of this._weapons.values()) {
-      if (weapon.isUnlocked) {
-        weapon.update(dt, playerPos, facingAngle);
-      }
-    }
-
-    // 2. Update all linear projectiles (collision sweep)
-    this._updateLinearProjectiles(dt);
-
-    // 3. Safety cap
-    if (this._projectilePool.activeCount > this._options.maxActiveProjectiles) {
-      this._cullOldestProjectiles(
-        this._projectilePool.activeCount - this._options.maxActiveProjectiles,
-      );
-    }
-  }
-
-  private _updateLinearProjectiles(dt: number): void {
-    const enemies = this._bridge.getEnemies();
-    const metaMap = new Map<string, SpriteSheetMeta>();
-
-    this._projectilePool.forEachActive((proj) => {
-      if (proj.motionType !== 'linear') return;
-
-      // Euler step
-      proj.pos = V2.add(proj.pos, V2.mul(proj.vel, dt));
-      proj.lifetime -= dt;
-
-      // Animation frame
-      const meta = metaMap.get(proj.spriteKey) ?? AssetAtlas[proj.spriteKey];
-      if (meta) {
-        metaMap.set(proj.spriteKey, meta);
-        proj.frameTimer -= dt;
-        if (proj.frameTimer <= 0) {
-          proj.frameTimer = proj.frameInterval;
-          proj.frameIndex = (proj.frameIndex + 1) % meta.totalFrames;
-        }
-      }
-
-      // Collision sweep: circle-circle vs all enemies
-      for (const e of enemies) {
-        if (!e.alive) continue;
-        if (M.circleCircle(proj.pos, proj.radius, e.pos, e.radius)) {
-          // Resolve impact via the weapon that owns this projectile
-          const weapon = this._weapons.get(proj.weaponKey);
-          if (weapon) {
-            weapon['_resolveImpact'](proj, e);
-          }
-          if (!proj.active) break;
-        }
-      }
-
-      if (proj.lifetime <= 0) {
-        proj.active = false;
-        this._projectilePool.release(proj);
-      }
+    this._observer = scene.onBeforeRenderObservable.add(() => {
+      if ((window as any).Game?.isPaused) return;
+      const dt = scene.getEngine().getDeltaTime() / 1000;
+      this._tickAll(dt);
     });
   }
 
-  private _cullOldestProjectiles(count: number): void {
-    // Simple cull: remove projectiles with the lowest remaining lifetime
-    const active: IProjectile[] = [];
-    this._projectilePool.forEachActive((p) => active.push(p));
-    active.sort((a, b) => a.lifetime - b.lifetime);
-    for (let i = 0; i < Math.min(count, active.length); i++) {
-      active[i].active = false;
+  /** Inject floating combat text renderer. */
+  public setCombatText(fn: CombatTextFn): void {
+    this._combatText = fn;
+    for (const w of this._weapons.values()) w.setCombatText(fn);
+  }
+
+  /** Add a weapon by id. Returns false if already present. */
+  public addWeapon(id: string): boolean {
+    if (this._weapons.has(id)) return false;
+
+    let weapon: BaseWeapon;
+    switch (id) {
+      case "sinners_quills":    weapon = new SinnersQuills(this._scene, this._vfx, this._player, this._bridge); break;
+      case "whirling_halberds": weapon = new WhirlingHalberds(this._scene, this._vfx, this._player, this._bridge); break;
+      case "zealots_chain":     weapon = new ZealotsChain(this._scene, this._vfx, this._player, this._bridge); break;
+      case "unholy_orbit":      weapon = new UnholyOrbit(this._scene, this._vfx, this._player, this._bridge); break;
+      case "grave_burst":       weapon = new GraveBurst(this._scene, this._vfx, this._player, this._bridge); break;
+      case "blood_siphon":      weapon = new BloodSiphon(this._scene, this._vfx, this._player, this._bridge); break;
+      case "abyssal_rift":      weapon = new AbyssalRift(this._scene, this._vfx, this._player, this._bridge); break;
+      case "font_of_torment":   weapon = new FontOfTorment(this._scene, this._vfx, this._player, this._bridge); break;
+      case "plague_swarm":      weapon = new PlagueSwarm(this._scene, this._vfx, this._player, this._bridge); break;
+      case "grave_chill":       weapon = new GraveChill(this._scene, this._vfx, this._player, this._bridge); break;
+      default: throw new Error(`WeaponManager: unknown weapon id "${id}"`);
+    }
+
+    if (this._combatText) weapon.setCombatText(this._combatText);
+    this._weapons.set(id, weapon);
+    return true;
+  }
+
+  /** Rank up a weapon. If at rank 5 and paired passive at rank 5, evolve. */
+  public rankUpWeapon(id: string): boolean {
+    const weapon = this._weapons.get(id);
+    if (!weapon) return false;
+
+    const pair = EVOLUTION_PAIRS.get(id);
+    if (pair && weapon.rank >= 5) {
+      // In a full build, query passive inventory here.
+      // For now, we gate evolution behind an explicit flag.
+      // weapon.isEvolved = true; // Set by external synthesis check
+    }
+
+    weapon.rankUp();
+    return true;
+  }
+
+  /** Force-evolve a weapon (called by external synthesis algorithm). */
+  public evolveWeapon(id: string): boolean {
+    const weapon = this._weapons.get(id);
+    if (!weapon) return false;
+    weapon.isEvolved = true;
+    return true;
+  }
+
+  /** Remove a weapon and dispose its resources. */
+  public removeWeapon(id: string): boolean {
+    const weapon = this._weapons.get(id);
+    if (!weapon) return false;
+    weapon.dispose();
+    this._weapons.delete(id);
+    return true;
+  }
+
+  /** Get a snapshot of current loadout for HUD rendering. */
+  public getLoadout(): Array<{ id: string; rank: number; evolved: boolean; cooldownPct: number }> {
+    return Array.from(this._weapons.values()).map((w) => ({
+      id: w.id,
+      rank: w.rank,
+      evolved: w.isEvolved,
+      cooldownPct: 0, // Could be wired per-weapon if needed
+    }));
+  }
+
+  /** Number of active weapons. */
+  public get count(): number {
+    return this._weapons.size;
+  }
+
+  /** Tick all active weapons. */
+  private _tickAll(dt: number): void {
+    for (const weapon of this._weapons.values()) {
+      weapon.tick(dt);
     }
   }
 
-  // ── Pool Introspection ─────────────────────────────────────────────────────
-
-  get projectilePool(): ObjectPool<IProjectile> {
-    return this._projectilePool;
-  }
-
-  get activeProjectileCount(): number {
-    return this._projectilePool.activeCount;
-  }
-
-  get poolCapacity(): number {
-    return this._projectilePool.capacity;
-  }
-
-  // ── Event Bus ──────────────────────────────────────────────────────────────
-
-  on(event: WeaponEventType, cb: EventCallback): () => void {
-    if (!this._eventListeners.has(event)) {
-      this._eventListeners.set(event, []);
+  /** Full cleanup. */
+  public dispose(): void {
+    if (this._observer) {
+      this._scene.onBeforeRenderObservable.remove(this._observer);
+      this._observer = null;
     }
-    this._eventListeners.get(event)!.push(cb);
-    return () => this.off(event, cb);
-  }
-
-  off(event: WeaponEventType, cb: EventCallback): void {
-    const arr = this._eventListeners.get(event);
-    if (!arr) return;
-    const idx = arr.indexOf(cb);
-    if (idx >= 0) arr.splice(idx, 1);
-  }
-
-  private _emit(evt: IWeaponEvent): void {
-    const arr = this._eventListeners.get(evt.type);
-    if (!arr) return;
-    for (const cb of arr) cb(evt);
-  }
-
-  // ── Factory Convenience ────────────────────────────────────────────────────
-
-  /**
-   * Build a complete WeaponManager pre-loaded with all 10 base weapons.
-   * This is the recommended initialization path.
-   */
-  static createFullLoadout(
-    bridge: ICollisionBridge,
-    vfx: IVFXPool,
-    options?: IWeaponManagerOptions,
-  ): WeaponManager {
-    const mgr = new WeaponManager(bridge, vfx, options);
-    const pool = mgr._projectilePool;
-
-    mgr.register('sinnersQuills', new SinnersQuills(WeaponConfigs.sinnersQuills, pool, bridge, vfx));
-    mgr.register('whirlingHalberds', new WhirlingHalberds(WeaponConfigs.whirlingHalberds, pool, bridge, vfx));
-    mgr.register('zealotsChain', new ZealotsChain(WeaponConfigs.zealotsChain, pool, bridge, vfx));
-    mgr.register('unholyOrbit', new UnholyOrbit(WeaponConfigs.unholyOrbit, pool, bridge, vfx));
-    mgr.register('graveBurst', new GraveBurst(WeaponConfigs.graveBurst, pool, bridge, vfx));
-    mgr.register('bloodSiphon', new BloodSiphon(WeaponConfigs.bloodSiphon, pool, bridge, vfx));
-    mgr.register('abyssalRift', new AbyssalRift(WeaponConfigs.abyssalRift, pool, bridge, vfx));
-    mgr.register('fontOfTorment', new FontOfTorment(WeaponConfigs.fontOfTorment, pool, bridge, vfx));
-    mgr.register('plagueSwarm', new PlagueSwarm(WeaponConfigs.plagueSwarm, pool, bridge, vfx));
-    mgr.register('graveChill', new GraveChill(WeaponConfigs.graveChill, pool, bridge, vfx));
-
-    return mgr;
+    for (const w of this._weapons.values()) w.dispose();
+    this._weapons.clear();
   }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 10: EXPORTS & MODULE INTERFACE
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export {
-  Vec2, Vec3,
-  IEnemy, IVFXPool, IVFXRequest, VFXType,
-  ICollisionBridge,
-  IWeaponConfig, WeaponLevelStats,
-  IProjectile, ProjectileMotionType,
-  Poolable, ObjectPool,
-  SpriteSheetMeta, FrameUV,
-};
