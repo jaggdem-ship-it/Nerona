@@ -69,11 +69,7 @@ export const ALL_LAYERS: readonly TileLayer[] = [
   TileLayer.ROOF,
 ];
 
-/** Edge-type tag used for Wang-style matching.
- *  Instead of listing every valid TileID neighbour, a tile declares the
- *  "edge flavour" it exposes on each side.  Two tiles stitch iff the
- *  touching edges share the same EdgeTag (or one side is WILDCARD).
- */
+/** Edge-type tag used for Wang-style matching. */
 export type EdgeTag = string & { readonly __brand: 'EdgeTag' };
 
 export function toEdgeTag(raw: string): EdgeTag {
@@ -90,60 +86,37 @@ export const EDGE_BLOCKED: EdgeTag = toEdgeTag('!');
    SECTION 2 -- TILE DEFINITION REGISTRY
    --------------------------------------------------------------------------- */
 
-/** Per-tile collision profile. */
 export interface CollisionProfile {
-  /** If true, entities cannot path through this tile. */
   readonly blocksMovement: boolean;
-  /** If true, projectiles / line-of-sight are stopped. */
   readonly blocksSight: boolean;
-  /** If true, the tile deals damage on contact (spikes, lava, etc). */
   readonly isHazard: boolean;
-  /** Hazard damage per tick (only meaningful if isHazard === true). */
   readonly hazardDamage?: number;
 }
 
-/** Sprite-sheet slicing metadata so the renderer knows where to sample. */
 export interface SpriteMeta {
-  /** Source spritesheet filename (matches uploaded assets). */
   readonly sheet: string;
-  /** Column index in the sheet (0-based). */
   readonly col: number;
-  /** Row index in the sheet (0-based). */
   readonly row: number;
-  /** Width in pixels of a single frame/tile within the sheet. */
   readonly frameWidth: number;
-  /** Height in pixels of a single frame/tile within the sheet. */
   readonly frameHeight: number;
-  /** For animated tiles: number of frames.  1 = static. */
   readonly frameCount: number;
-  /** Animation speed in ms per frame. */
   readonly frameIntervalMs?: number;
-  /** If the sprite should be rendered with additive blending. */
   readonly additiveBlend?: boolean;
 }
 
-/** A single logical tile definition.  Pure data -- no GPU handles. */
 export interface TileDef {
   readonly id: TileID;
   readonly layer: TileLayer;
   readonly displayName: string;
-  /** Which biome(s) this tile belongs to.  Empty = universal. */
   readonly biomes: readonly string[];
-  /** Edge tags exposed on each cardinal side (Wang-style). */
   readonly edges: Record<CardinalDir, EdgeTag>;
-  /** Collision behaviour. */
   readonly collision: CollisionProfile;
-  /** Rendering metadata (optional for logical-only tiles). */
   readonly sprite?: SpriteMeta;
-  /** Z-order offset within the same layer for painter's algorithm. */
   readonly zOffset: number;
-  /** If true, this tile may be randomly rotated 90/180/270 deg by generator. */
   readonly allowRotation: boolean;
-  /** Tags for querying (e.g. "stone", "organic", "gilded"). */
   readonly tags: readonly string[];
 }
 
-/** The master registry mapping TileID -> TileDef. */
 export class TileRegistry {
   private readonly _map = new Map<TileID, TileDef>();
 
@@ -163,19 +136,16 @@ export class TileRegistry {
     return this._map.has(id);
   }
 
-  /** All definitions belonging to a specific layer. */
   byLayer(layer: TileLayer): readonly TileDef[] {
     return Array.from(this._map.values()).filter((d) => d.layer === layer);
   }
 
-  /** All definitions tagged for a given biome. */
   byBiome(biomeName: string): readonly TileDef[] {
     return Array.from(this._map.values()).filter(
       (d) => d.biomes.length === 0 || d.biomes.includes(biomeName)
     );
   }
 
-  /** Query by tag intersection. */
   byTags(...tags: string[]): readonly TileDef[] {
     return Array.from(this._map.values()).filter((d) =>
       tags.every((t) => d.tags.includes(t))
@@ -186,7 +156,6 @@ export class TileRegistry {
     return this._map.size;
   }
 
-  /** Deep-freeze the registry so downstream systems cannot mutate it. */
   seal(): ReadonlyMap<TileID, TileDef> {
     return new Map(this._map);
   }
@@ -196,25 +165,15 @@ export class TileRegistry {
    SECTION 3 -- ADJACENCY RULE MATRIX
    --------------------------------------------------------------------------- */
 
-/** A compiled adjacency rule entry.
- *  For a given (TileID + Direction) we store the set of EdgeTags that are
- *  considered valid on the *neighbour's* touching edge.
- */
 export interface AdjacencyRule {
   readonly sourceId: TileID;
   readonly direction: CardinalDir;
-  /** Valid edge tags on the neighbour's side.  If the neighbour exposes any
-   *  tag in this set, the stitch is legal. */
   readonly validNeighbourTags: ReadonlySet<EdgeTag>;
-  /** If true, the rule engine skips validation for this direction. */
   readonly isWildcard: boolean;
 }
 
-/** The compiled rule matrix -- a flat map keyed by "TileID|Direction". */
 export type RuleMatrix = ReadonlyMap<string, AdjacencyRule>;
 
-/** Builder that converts raw TileDef edge declarations into a fast-lookup
- *  rule matrix and validates consistency (bidirectional symmetry). */
 export class AdjacencyRuleCompiler {
   private readonly _registry: TileRegistry;
   private readonly _rules = new Map<string, AdjacencyRule>();
@@ -224,7 +183,6 @@ export class AdjacencyRuleCompiler {
     this._registry = registry;
   }
 
-  /** Compile all registered tiles into the matrix. */
   compile(): RuleMatrix {
     this._rules.clear();
     this._symmetryViolations.length = 0;
@@ -256,8 +214,6 @@ export class AdjacencyRuleCompiler {
           continue;
         }
 
-        /* Normal edge tag: any neighbour whose OPPOSITE edge matches this tag
-         * OR exposes WILDCARD is valid. */
         const validTags = new Set<EdgeTag>([edgeTag, EDGE_WILDCARD]);
         this._rules.set(key, {
           sourceId: def.id,
@@ -268,10 +224,6 @@ export class AdjacencyRuleCompiler {
       }
     }
 
-    /* -- Bidirectional symmetry check --
-     * If tile A accepts tile B to the East, tile B must accept tile A to
-     * the West (unless one side is WILDCARD).  We flag asymmetries so the
-     * designer can fix the dataset rather than discovering them at runtime. */
     for (const def of allDefs) {
       for (const dir of Object.values(CardinalDir)) {
         const myEdge = def.edges[dir];
@@ -290,7 +242,6 @@ export class AdjacencyRuleCompiler {
           const myRule = this._rules.get(myAcceptsOtherKey)!;
           const iAcceptOther = myRule.validNeighbourTags.has(otherEdge);
 
-          /* We only care about *mutual* acceptance for non-wildcards. */
           if (otherAcceptsMe && !iAcceptOther) {
             this._symmetryViolations.push(
               `Asymmetry: ${def.id}[${dir}]=${myEdge} accepts ${other.id}[${opp}]=${otherEdge}, ` +
@@ -320,11 +271,9 @@ export class AdjacencyRuleCompiler {
   }
 }
 
-/** Fast runtime validator using the compiled matrix. */
 export class AdjacencyValidator {
   constructor(private readonly _matrix: RuleMatrix) {}
 
-  /** Returns true if `neighbourId` can legally sit in `direction` from `sourceId`. */
   canStitch(
     sourceId: TileID,
     direction: CardinalDir,
@@ -334,7 +283,6 @@ export class AdjacencyValidator {
     const key = `${sourceId}|${direction}`;
     const rule = this._matrix.get(key);
     if (!rule) {
-      /* No rule defined -- treat as blocked for safety. */
       return false;
     }
 
@@ -349,7 +297,6 @@ export class AdjacencyValidator {
     return rule.validNeighbourTags.has(neighbourEdge);
   }
 
-  /** Returns the set of TileIDs that can legally neighbour `sourceId` in `direction`. */
   validNeighbours(
     sourceId: TileID,
     direction: CardinalDir,
@@ -359,7 +306,7 @@ export class AdjacencyValidator {
     const rule = this._matrix.get(key);
     if (!rule) return [];
     if (rule.isWildcard) {
-      return registry.byLayer(TileLayer.SUBFLOOR).map((d) => d.id); /* all */
+      return registry.byLayer(TileLayer.SUBFLOOR).map((d) => d.id);
     }
 
     const opp = OPPOSITE_DIR[direction];
@@ -377,23 +324,13 @@ export class AdjacencyValidator {
    SECTION 4 -- BIOME TEMPLATES
    --------------------------------------------------------------------------- */
 
-/** A pre-authored biome configuration containing:
- *  - The palette of TileIDs that may appear in this biome.
- *  - Layer-specific fill weights (for procedural generation).
- *  - Global rule overrides (e.g. "no two hazard tiles adjacent").
- */
 export interface BiomeTemplate {
   readonly name: string;
   readonly displayName: string;
-  /** Ordered palette of TileIDs allowed in this biome. */
   readonly palette: readonly TileID[];
-  /** Default sub-floor tile used when no specific tile is chosen. */
   readonly defaultSubFloor: TileID;
-  /** Per-layer weights for random fill algorithms.  Sum need not be 1. */
   readonly layerWeights: Record<TileLayer, number>;
-  /** Global adjacency bans (pairs of tags that may never touch). */
   readonly bannedAdjacencies: readonly { tagA: string; tagB: string }[];
-  /** Ambient tint / lighting hints (pure data -- renderer interprets). */
   readonly ambientLight: {
     readonly hue: number;
     readonly saturation: number;
@@ -405,7 +342,6 @@ export interface BiomeTemplate {
    SECTION 5 -- LAYOUT INTEGRITY ENGINE
    --------------------------------------------------------------------------- */
 
-/** A single cell in the 2-D grid.  Each layer holds at most one TileID. */
 export interface GridCell {
   readonly layers: {
     [TileLayer.SUBFLOOR]?: TileID;
@@ -413,21 +349,17 @@ export interface GridCell {
     [TileLayer.WALL]?: TileID;
     [TileLayer.ROOF]?: TileID;
   };
-  /** Optional metadata for procedural generators (seed noise, region id, ...). */
   readonly meta?: Record<string, number | string | boolean>;
 }
 
-/** A 2-D array of GridCells.  Outer array = rows (Y), inner = cols (X). */
 export type GridArray = readonly (readonly GridCell[])[];
 
-/** Severity classification for integrity violations. */
 export enum ViolationSeverity {
-  CRITICAL = 'CRITICAL',   // e.g. wall floating in void
-  WARNING  = 'WARNING',    // e.g. mismatched decor edge
-  INFO     = 'INFO',       // e.g. optional symmetry suggestion
+  CRITICAL = 'CRITICAL',
+  WARNING  = 'WARNING',
+  INFO     = 'INFO',
 }
 
-/** A single flagged stitch violation. */
 export interface IntegrityViolation {
   readonly severity: ViolationSeverity;
   readonly x: number;
@@ -441,19 +373,15 @@ export interface IntegrityViolation {
   readonly message: string;
 }
 
-/** A suggested correction for a violated cell. */
 export interface CorrectionSuggestion {
   readonly x: number;
   readonly y: number;
   readonly layer: TileLayer;
   readonly currentTileId: TileID;
-  /** TileIDs that would resolve the violation (ordered by best fit). */
   readonly suggestedReplacements: readonly TileID[];
-  /** If true, the cell can also be fixed by clearing the layer. */
   readonly canClear: boolean;
 }
 
-/** Complete output of the integrity verification pass. */
 export interface IntegrityReport {
   readonly gridWidth: number;
   readonly gridHeight: number;
@@ -467,18 +395,12 @@ export interface IntegrityReport {
   };
 }
 
-/** The core layout integrity verifier. */
 export class LayoutIntegrityEngine {
   constructor(
     private readonly _registry: TileRegistry,
     private readonly _matrix: RuleMatrix
   ) {}
 
-  /**
-   * Verify every cell in `gridArray` against its 4 cardinal neighbours using
-   * the compiled adjacency rule matrix.  Returns a full report + correction
-   * buffer.
-   */
   verifyLayoutIntegrity(gridArray: GridArray): IntegrityReport {
     const violations: IntegrityViolation[] = [];
     const corrections: CorrectionSuggestion[] = [];
@@ -508,7 +430,6 @@ export class LayoutIntegrityEngine {
             continue;
           }
 
-          /* Check each cardinal neighbour. */
           const dirs: CardinalDir[] = [
             CardinalDir.NORTH,
             CardinalDir.SOUTH,
@@ -520,8 +441,6 @@ export class LayoutIntegrityEngine {
             const nx = x + (dir === CardinalDir.EAST ? 1 : dir === CardinalDir.WEST ? -1 : 0);
             const ny = y + (dir === CardinalDir.SOUTH ? 1 : dir === CardinalDir.NORTH ? -1 : 0);
 
-            /* Out-of-bounds is treated as EDGE_BLOCKED -- only allowed if
-             * the source tile itself exposes EDGE_BLOCKED on that side. */
             if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
               if (def.edges[dir] !== EDGE_BLOCKED && def.edges[dir] !== EDGE_WILDCARD) {
                 violations.push({
@@ -539,8 +458,6 @@ export class LayoutIntegrityEngine {
             const neighbourCell = gridArray[ny][nx];
             const neighbourTileId = neighbourCell.layers[layer];
 
-            /* Empty neighbour layer is only a problem if the source tile
-             * expects a specific edge match (not WILDCARD / BLOCKED). */
             if (!neighbourTileId) {
               if (def.edges[dir] !== EDGE_WILDCARD && def.edges[dir] !== EDGE_BLOCKED) {
                 violations.push({
@@ -589,10 +506,6 @@ export class LayoutIntegrityEngine {
       }
     }
 
-    /* -- Build correction buffer --
-     * For every unique (x,y,layer) that appears in a violation, compute
-     * the set of TileIDs that would satisfy *all* of its existing
-     * neighbours simultaneously. */
     const violationMap = new Map<string, IntegrityViolation[]>();
     for (const v of violations) {
       const key = `${v.x},${v.y},${v.layer}`;
@@ -607,7 +520,6 @@ export class LayoutIntegrityEngine {
       const layer = parseInt(layerStr, 10) as TileLayer;
       const currentTileId = gridArray[y][x].layers[layer]!;
 
-      /* Gather constraints from all 4 directions based on actual neighbours. */
       const requiredTags = new Map<CardinalDir, Set<EdgeTag>>();
       for (const dir of Object.values(CardinalDir)) {
         requiredTags.set(dir, new Set<EdgeTag>());
@@ -633,21 +545,18 @@ export class LayoutIntegrityEngine {
         const opp = OPPOSITE_DIR[dir];
         const nEdge = nDef.edges[opp];
 
-        /* We need a tile whose `dir` edge matches nEdge (or WILDCARD). */
         if (nEdge !== EDGE_WILDCARD) {
           requiredTags.get(dir)!.add(nEdge);
         }
-        /* If neighbour is WILDCARD, we have no constraint from that side. */
       }
 
-      /* Find all tiles in the same layer that satisfy every directional constraint. */
       const candidates: TileID[] = [];
       for (const def of this._registry.byLayer(layer)) {
         let ok = true;
         for (const dir of Object.values(CardinalDir)) {
           const reqs = requiredTags.get(dir)!;
-          if (reqs.size === 0) continue; // no constraint from this side
-          if (def.edges[dir] === EDGE_WILDCARD) continue; // this tile doesn't care
+          if (reqs.size === 0) continue;
+          if (def.edges[dir] === EDGE_WILDCARD) continue;
           if (!reqs.has(def.edges[dir])) {
             ok = false;
             break;
@@ -683,14 +592,12 @@ export class LayoutIntegrityEngine {
    SECTION 6 -- PRE-AUTHORED DATASETS
    --------------------------------------------------------------------------- */
 
-/** Factory that builds the complete registry + 3 biome templates. */
 export function buildMasterTileSet(): {
   registry: TileRegistry;
   biomes: Record<string, BiomeTemplate>;
 } {
   const registry = new TileRegistry();
 
-  /* -- Edge tag vocabulary (shared across biomes) -- */
   const E = {
     STONE_FLOOR:    toEdgeTag('stone_floor'),
     STONE_WALL:     toEdgeTag('stone_wall'),
@@ -713,17 +620,10 @@ export function buildMasterTileSet(): {
     ANY:            EDGE_WILDCARD,
   };
 
-  /* ========================================================================
-     BIOME 1 -- FORGOTTEN CRYPTS
-     Asset: watermarked_img_13833476961244809141.jpg (crypt tileset)
-     ======================================================================== */
-
-  /* -- Layer 0: Sub-Floor -- */
+  /* BIOME 1 -- FORGOTTEN CRYPTS */
   registry.register({
-    id: toTileID('CRYPT_STONE_FLOOR'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Crypt Stone Floor',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_STONE_FLOOR'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Crypt Stone Floor', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_FLOOR, S: E.STONE_FLOOR, E: E.STONE_FLOOR, W: E.STONE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 0, row: 0, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -731,10 +631,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_MOSS_FLOOR'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Crypt Moss Floor',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_MOSS_FLOOR'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Crypt Moss Floor', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_FLOOR, S: E.STONE_FLOOR, E: E.STONE_FLOOR, W: E.STONE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 1, row: 1, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -742,22 +640,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_BLOOD_FLOOR'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Crypt Blood-Stained Floor',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_BLOOD_FLOOR'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Crypt Blood-Stained Floor', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_FLOOR, S: E.STONE_FLOOR, E: E.STONE_FLOOR, W: E.STONE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 0, row: 2, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 0, allowRotation: true, tags: ['stone', 'blood', 'floor', 'crypt'],
   });
 
-  /* -- Layer 1: Decor -- */
   registry.register({
-    id: toTileID('CRYPT_BLOOD_POOL'),
-    layer: TileLayer.DECOR,
-    displayName: 'Blood Pool',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_BLOOD_POOL'), layer: TileLayer.DECOR,
+    displayName: 'Blood Pool', biomes: ['forgotten_crypts'],
     edges: { N: E.BLOOD_POOL, S: E.BLOOD_POOL, E: E.BLOOD_POOL, W: E.BLOOD_POOL },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 3, row: 7, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -765,10 +658,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_MOSS_DECAL'),
-    layer: TileLayer.DECOR,
-    displayName: 'Moss Decal',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_MOSS_DECAL'), layer: TileLayer.DECOR,
+    displayName: 'Moss Decal', biomes: ['forgotten_crypts'],
     edges: { N: E.MOSS_PATCH, S: E.MOSS_PATCH, E: E.MOSS_PATCH, W: E.MOSS_PATCH },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 2, row: 1, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -776,22 +667,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_CHAIN_DECOR'),
-    layer: TileLayer.DECOR,
-    displayName: 'Hanging Chains',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_CHAIN_DECOR'), layer: TileLayer.DECOR,
+    displayName: 'Hanging Chains', biomes: ['forgotten_crypts'],
     edges: { N: E.ANY, S: E.ANY, E: E.ANY, W: E.ANY },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 2, row: 7, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 2, allowRotation: false, tags: ['iron', 'decal', 'crypt'],
   });
 
-  /* -- Layer 2: Walls / Collidables -- */
   registry.register({
-    id: toTileID('CRYPT_WALL'),
-    layer: TileLayer.WALL,
-    displayName: 'Crypt Stone Wall',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_WALL'), layer: TileLayer.WALL,
+    displayName: 'Crypt Stone Wall', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_WALL, S: E.STONE_WALL, E: E.STONE_WALL, W: E.STONE_WALL },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 0, row: 3, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -799,10 +685,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_WALL_TRIM'),
-    layer: TileLayer.WALL,
-    displayName: 'Crypt Wall with Trim',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_WALL_TRIM'), layer: TileLayer.WALL,
+    displayName: 'Crypt Wall with Trim', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_TRIM, S: E.STONE_WALL, E: E.STONE_WALL, W: E.STONE_WALL },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 1, row: 3, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -810,10 +694,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_ARCH'),
-    layer: TileLayer.WALL,
-    displayName: 'Crypt Archway',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_ARCH'), layer: TileLayer.WALL,
+    displayName: 'Crypt Archway', biomes: ['forgotten_crypts'],
     edges: { N: E.ARCH_STONE, S: E.STONE_WALL, E: E.ARCH_STONE, W: E.ARCH_STONE },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 8, row: 5, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -821,10 +703,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_PILLAR'),
-    layer: TileLayer.WALL,
-    displayName: 'Crypt Pillar',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_PILLAR'), layer: TileLayer.WALL,
+    displayName: 'Crypt Pillar', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_WALL, S: E.STONE_WALL, E: E.STONE_WALL, W: E.STONE_WALL },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: 'watermarked_img_15575049127886312154.jpg', col: 0, row: 0, frameWidth: 64, frameHeight: 128, frameCount: 1 },
@@ -832,10 +712,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_IRON_GATE'),
-    layer: TileLayer.WALL,
-    displayName: 'Crypt Iron Gate',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_IRON_GATE'), layer: TileLayer.WALL,
+    displayName: 'Crypt Iron Gate', biomes: ['forgotten_crypts'],
     edges: { N: E.IRON_FENCE, S: E.IRON_FENCE, E: E.GATEWAY, W: E.GATEWAY },
     collision: { blocksMovement: true, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 10, row: 7, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -843,10 +721,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_SPIKE_TRAP'),
-    layer: TileLayer.WALL,
-    displayName: 'Floor Spike Trap',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_SPIKE_TRAP'), layer: TileLayer.WALL,
+    displayName: 'Floor Spike Trap', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_FLOOR, S: E.STONE_FLOOR, E: E.STONE_FLOOR, W: E.STONE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: true, hazardDamage: 15 },
     sprite: { sheet: 'watermarked_img_15575049127886312154.jpg', col: 6, row: 4, frameWidth: 64, frameHeight: 64, frameCount: 4, frameIntervalMs: 200 },
@@ -854,39 +730,27 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('CRYPT_SARCOPHAGUS'),
-    layer: TileLayer.WALL,
-    displayName: 'Stone Sarcophagus',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_SARCOPHAGUS'), layer: TileLayer.WALL,
+    displayName: 'Stone Sarcophagus', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_WALL, S: E.STONE_FLOOR, E: E.STONE_FLOOR, W: E.STONE_FLOOR },
     collision: { blocksMovement: true, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_15575049127886312154.jpg', col: 0, row: 3, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 8, allowRotation: true, tags: ['stone', 'sarcophagus', 'crypt'],
   });
 
-  /* -- Layer 3: Roof / Overhead -- */
   registry.register({
-    id: toTileID('CRYPT_CEILING'),
-    layer: TileLayer.ROOF,
-    displayName: 'Crypt Ceiling',
-    biomes: ['forgotten_crypts'],
+    id: toTileID('CRYPT_CEILING'), layer: TileLayer.ROOF,
+    displayName: 'Crypt Ceiling', biomes: ['forgotten_crypts'],
     edges: { N: E.STONE_WALL, S: E.STONE_WALL, E: E.STONE_WALL, W: E.STONE_WALL },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 0, row: 4, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 20, allowRotation: true, tags: ['stone', 'ceiling', 'crypt'],
   });
 
-  /* ========================================================================
-     BIOME 2 -- MANSION COURTYARD
-     Asset: 3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg (roof + exterior)
-     ======================================================================== */
-
-  /* -- Layer 0: Sub-Floor -- */
+  /* BIOME 2 -- MANSION COURTYARD */
   registry.register({
-    id: toTileID('COURTYARD_COBBLE'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Cobblestone Path',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_COBBLE'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Cobblestone Path', biomes: ['mansion_courtyard'],
     edges: { N: E.COBBLE_FLOOR, S: E.COBBLE_FLOOR, E: E.COBBLE_FLOOR, W: E.COBBLE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg', col: 0, row: 6, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -894,22 +758,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('COURTYARD_GRASS'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Wild Grass',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_GRASS'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Wild Grass', biomes: ['mansion_courtyard'],
     edges: { N: E.COBBLE_FLOOR, S: E.COBBLE_FLOOR, E: E.COBBLE_FLOOR, W: E.COBBLE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_13833476961244809141.jpg', col: 2, row: 1, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 0, allowRotation: true, tags: ['grass', 'floor', 'courtyard'],
   });
 
-  /* -- Layer 1: Decor -- */
   registry.register({
-    id: toTileID('COURTYARD_HEDGE'),
-    layer: TileLayer.DECOR,
-    displayName: 'Wild Hedge',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_HEDGE'), layer: TileLayer.DECOR,
+    displayName: 'Wild Hedge', biomes: ['mansion_courtyard'],
     edges: { N: E.HEDGE, S: E.HEDGE, E: E.HEDGE, W: E.HEDGE },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: '3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg', col: 0, row: 5, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -917,22 +776,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('COURTYARD_GARGOYLE'),
-    layer: TileLayer.DECOR,
-    displayName: 'Stone Gargoyle',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_GARGOYLE'), layer: TileLayer.DECOR,
+    displayName: 'Stone Gargoyle', biomes: ['mansion_courtyard'],
     edges: { N: E.STONE_TRIM, S: E.COBBLE_FLOOR, E: E.COBBLE_FLOOR, W: E.COBBLE_FLOOR },
     collision: { blocksMovement: true, blocksSight: false, isHazard: false },
     sprite: { sheet: '3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg', col: 7, row: 0, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 6, allowRotation: false, tags: ['stone', 'gargoyle', 'courtyard'],
   });
 
-  /* -- Layer 2: Walls -- */
   registry.register({
-    id: toTileID('COURTYARD_EXT_WALL'),
-    layer: TileLayer.WALL,
-    displayName: 'Exterior Stone Wall',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_EXT_WALL'), layer: TileLayer.WALL,
+    displayName: 'Exterior Stone Wall', biomes: ['mansion_courtyard'],
     edges: { N: E.STONE_WALL, S: E.STONE_WALL, E: E.STONE_WALL, W: E.STONE_WALL },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: '3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg', col: 0, row: 4, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -940,10 +794,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('COURTYARD_IRON_FENCE'),
-    layer: TileLayer.WALL,
-    displayName: 'Wrought-Iron Fence',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_IRON_FENCE'), layer: TileLayer.WALL,
+    displayName: 'Wrought-Iron Fence', biomes: ['mansion_courtyard'],
     edges: { N: E.IRON_FENCE, S: E.IRON_FENCE, E: E.IRON_FENCE, W: E.IRON_FENCE },
     collision: { blocksMovement: true, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_15575049127886312154.jpg', col: 0, row: 1, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -951,22 +803,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('COURTYARD_GATE'),
-    layer: TileLayer.WALL,
-    displayName: 'Courtyard Gate',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_GATE'), layer: TileLayer.WALL,
+    displayName: 'Courtyard Gate', biomes: ['mansion_courtyard'],
     edges: { N: E.GATEWAY, S: E.GATEWAY, E: E.IRON_FENCE, W: E.IRON_FENCE },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: 'watermarked_img_15575049127886312154.jpg', col: 4, row: 2, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 10, allowRotation: true, tags: ['iron', 'gate', 'courtyard'],
   });
 
-  /* -- Layer 3: Roof -- */
   registry.register({
-    id: toTileID('COURTYARD_ROOF_SLATE'),
-    layer: TileLayer.ROOF,
-    displayName: 'Slate Roof',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_ROOF_SLATE'), layer: TileLayer.ROOF,
+    displayName: 'Slate Roof', biomes: ['mansion_courtyard'],
     edges: { N: E.ROOF_SLATE, S: E.ROOF_SLATE, E: E.ROOF_SLATE, W: E.ROOF_SLATE },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg', col: 0, row: 0, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -974,27 +821,18 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('COURTYARD_ROOF_SPIRE'),
-    layer: TileLayer.ROOF,
-    displayName: 'Gothic Spire',
-    biomes: ['mansion_courtyard'],
+    id: toTileID('COURTYARD_ROOF_SPIRE'), layer: TileLayer.ROOF,
+    displayName: 'Gothic Spire', biomes: ['mansion_courtyard'],
     edges: { N: E.ROOF_TRIM, S: E.ROOF_SLATE, E: E.ROOF_TRIM, W: E.ROOF_TRIM },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '3a20d947-abb5-461c-8568-1c42fe8fbfe1.jpeg', col: 3, row: 0, frameWidth: 64, frameHeight: 128, frameCount: 1 },
     zOffset: 25, allowRotation: false, tags: ['slate', 'spire', 'roof', 'courtyard'],
   });
 
-  /* ========================================================================
-     BIOME 3 -- GRAND MANSION INTERIOR
-     Asset: 378efd71-5a57-443d-89f2-4fed5829e00e.jpeg (interior tileset)
-     ======================================================================== */
-
-  /* -- Layer 0: Sub-Floor -- */
+  /* BIOME 3 -- GRAND MANSION INTERIOR */
   registry.register({
-    id: toTileID('MANSION_WOOD_FLOOR'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Polished Wood Floor',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_WOOD_FLOOR'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Polished Wood Floor', biomes: ['grand_mansion_interior'],
     edges: { N: E.WOOD_FLOOR, S: E.WOOD_FLOOR, E: E.WOOD_FLOOR, W: E.WOOD_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 0, row: 0, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -1002,22 +840,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('MANSION_MARBLE_FLOOR'),
-    layer: TileLayer.SUBFLOOR,
-    displayName: 'Cracked Marble Floor',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_MARBLE_FLOOR'), layer: TileLayer.SUBFLOOR,
+    displayName: 'Cracked Marble Floor', biomes: ['grand_mansion_interior'],
     edges: { N: E.MARBLE_FLOOR, S: E.MARBLE_FLOOR, E: E.MARBLE_FLOOR, W: E.MARBLE_FLOOR },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 0, row: 2, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 0, allowRotation: true, tags: ['marble', 'floor', 'mansion'],
   });
 
-  /* -- Layer 1: Decor -- */
   registry.register({
-    id: toTileID('MANSION_RED_CARPET'),
-    layer: TileLayer.DECOR,
-    displayName: 'Velvet Red Carpet',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_RED_CARPET'), layer: TileLayer.DECOR,
+    displayName: 'Velvet Red Carpet', biomes: ['grand_mansion_interior'],
     edges: { N: E.VELVET_CARPET, S: E.VELVET_CARPET, E: E.VELVET_CARPET, W: E.VELVET_CARPET },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 4, row: 0, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -1025,10 +858,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('MANSION_CANDELABRA'),
-    layer: TileLayer.DECOR,
-    displayName: 'Gold Candelabra',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_CANDELABRA'), layer: TileLayer.DECOR,
+    displayName: 'Gold Candelabra', biomes: ['grand_mansion_interior'],
     edges: { N: E.ANY, S: E.ANY, E: E.ANY, W: E.ANY },
     collision: { blocksMovement: true, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 10, row: 6, frameWidth: 64, frameHeight: 64, frameCount: 3, frameIntervalMs: 150, additiveBlend: true },
@@ -1036,22 +867,17 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('MANSION_RUG_TASSEL'),
-    layer: TileLayer.DECOR,
-    displayName: 'Tasseled Rug',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_RUG_TASSEL'), layer: TileLayer.DECOR,
+    displayName: 'Tasseled Rug', biomes: ['grand_mansion_interior'],
     edges: { N: E.VELVET_CARPET, S: E.VELVET_CARPET, E: E.VELVET_CARPET, W: E.VELVET_CARPET },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 0, row: 6, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 2, allowRotation: true, tags: ['velvet', 'rug', 'mansion'],
   });
 
-  /* -- Layer 2: Walls -- */
   registry.register({
-    id: toTileID('MANSION_WOOD_PANEL'),
-    layer: TileLayer.WALL,
-    displayName: 'Wood Panel Wall',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_WOOD_PANEL'), layer: TileLayer.WALL,
+    displayName: 'Wood Panel Wall', biomes: ['grand_mansion_interior'],
     edges: { N: E.WOOD_TRIM, S: E.WOOD_FLOOR, E: E.WOOD_TRIM, W: E.WOOD_TRIM },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 0, row: 3, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -1059,10 +885,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('MANSION_BOOKSHELF'),
-    layer: TileLayer.WALL,
-    displayName: 'Grand Bookshelf',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_BOOKSHELF'), layer: TileLayer.WALL,
+    displayName: 'Grand Bookshelf', biomes: ['grand_mansion_interior'],
     edges: { N: E.WOOD_TRIM, S: E.WOOD_FLOOR, E: E.WOOD_TRIM, W: E.WOOD_TRIM },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 0, row: 5, frameWidth: 64, frameHeight: 64, frameCount: 1 },
@@ -1070,10 +894,8 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('MANSION_FIREPLACE'),
-    layer: TileLayer.WALL,
-    displayName: 'Marble Fireplace',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_FIREPLACE'), layer: TileLayer.WALL,
+    displayName: 'Marble Fireplace', biomes: ['grand_mansion_interior'],
     edges: { N: E.STONE_TRIM, S: E.WOOD_FLOOR, E: E.STONE_TRIM, W: E.STONE_TRIM },
     collision: { blocksMovement: true, blocksSight: true, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 9, row: 3, frameWidth: 64, frameHeight: 64, frameCount: 4, frameIntervalMs: 120, additiveBlend: true },
@@ -1081,29 +903,23 @@ export function buildMasterTileSet(): {
   });
 
   registry.register({
-    id: toTileID('MANSION_ARCH'),
-    layer: TileLayer.WALL,
-    displayName: 'Interior Arch',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_ARCH'), layer: TileLayer.WALL,
+    displayName: 'Interior Arch', biomes: ['grand_mansion_interior'],
     edges: { N: E.ARCH_STONE, S: E.WOOD_FLOOR, E: E.ARCH_STONE, W: E.ARCH_STONE },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 8, row: 5, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 10, allowRotation: false, tags: ['stone', 'arch', 'mansion'],
   });
 
-  /* -- Layer 3: Roof -- */
   registry.register({
-    id: toTileID('MANSION_CEILING_BEAM'),
-    layer: TileLayer.ROOF,
-    displayName: 'Wood Ceiling Beam',
-    biomes: ['grand_mansion_interior'],
+    id: toTileID('MANSION_CEILING_BEAM'), layer: TileLayer.ROOF,
+    displayName: 'Wood Ceiling Beam', biomes: ['grand_mansion_interior'],
     edges: { N: E.WOOD_TRIM, S: E.WOOD_TRIM, E: E.WOOD_TRIM, W: E.WOOD_TRIM },
     collision: { blocksMovement: false, blocksSight: false, isHazard: false },
     sprite: { sheet: '378efd71-5a57-443d-89f2-4fed5829e00e.jpeg', col: 0, row: 4, frameWidth: 64, frameHeight: 64, frameCount: 1 },
     zOffset: 20, allowRotation: true, tags: ['wood', 'ceiling', 'mansion'],
   });
 
-  /* -- Compile the adjacency matrix -- */
   const compiler = new AdjacencyRuleCompiler(registry);
   const matrix = compiler.compile();
 
@@ -1111,7 +927,6 @@ export function buildMasterTileSet(): {
     console.error('Symmetry violations detected during build:', compiler.symmetryViolations);
   }
 
-  /* -- Build biome templates -- */
   const biomes: Record<string, BiomeTemplate> = {
     forgotten_crypts: {
       name: 'forgotten_crypts',
@@ -1140,7 +955,7 @@ export function buildMasterTileSet(): {
         [TileLayer.ROOF]: 0.15,
       },
       bannedAdjacencies: [
-        { tagA: 'blood', tagB: 'moss' },   // blood pools don't touch moss
+        { tagA: 'blood', tagB: 'moss' },
       ],
       ambientLight: { hue: 260, saturation: 0.15, lightness: 0.08 },
     },
@@ -1167,7 +982,7 @@ export function buildMasterTileSet(): {
         [TileLayer.ROOF]: 0.1,
       },
       bannedAdjacencies: [
-        { tagA: 'hedge', tagB: 'gargoyle' }, // gargoyles don't sit inside hedges
+        { tagA: 'hedge', tagB: 'gargoyle' },
       ],
       ambientLight: { hue: 210, saturation: 0.10, lightness: 0.35 },
     },
@@ -1195,7 +1010,7 @@ export function buildMasterTileSet(): {
         [TileLayer.ROOF]: 0.2,
       },
       bannedAdjacencies: [
-        { tagA: 'fire', tagB: 'books' }, // fireplaces don't touch bookshelves directly
+        { tagA: 'fire', tagB: 'books' },
       ],
       ambientLight: { hue: 30, saturation: 0.25, lightness: 0.18 },
     },
@@ -1203,3 +1018,125 @@ export function buildMasterTileSet(): {
 
   return { registry, biomes };
 }
+
+/* ---------------------------------------------------------------------------
+   SECTION 7 -- UTILITY / SERIALIZATION HELPERS
+   --------------------------------------------------------------------------- */
+
+export function serializeGrid(grid: GridArray): string {
+  const rows = grid.map((row) =>
+    row.map((cell) => ({
+      l0: cell.layers[TileLayer.SUBFLOOR] ?? null,
+      l1: cell.layers[TileLayer.DECOR] ?? null,
+      l2: cell.layers[TileLayer.WALL] ?? null,
+      l3: cell.layers[TileLayer.ROOF] ?? null,
+      m: cell.meta ?? undefined,
+    }))
+  );
+  return JSON.stringify({ version: 1, width: rows[0]?.length ?? 0, height: rows.length, rows });
+}
+
+export function deserializeGrid(json: string): GridArray {
+  const parsed = JSON.parse(json);
+  if (parsed.version !== 1) throw new Error(`Unsupported grid version ${parsed.version}`);
+
+  return parsed.rows.map((row: any[]) =>
+    row.map((cell: any) => ({
+      layers: {
+        [TileLayer.SUBFLOOR]: cell.l0 ? toTileID(cell.l0) : undefined,
+        [TileLayer.DECOR]: cell.l1 ? toTileID(cell.l1) : undefined,
+        [TileLayer.WALL]: cell.l2 ? toTileID(cell.l2) : undefined,
+        [TileLayer.ROOF]: cell.l3 ? toTileID(cell.l3) : undefined,
+      },
+      meta: cell.m,
+    }))
+  );
+}
+
+export function formatIntegrityReport(report: IntegrityReport): string {
+  const lines: string[] = [];
+  lines.push(`╔══════════════════════════════════════════════════════════════╗`);
+  lines.push(`║          WORLD TILE INTEGRITY REPORT                         ║`);
+  lines.push(`╠══════════════════════════════════════════════════════════════╣`);
+  lines.push(`║ Grid Size     : ${report.gridWidth}x${report.gridHeight}`.padEnd(63) + `║`);
+  lines.push(`║ Valid         : ${report.isValid ? 'YES' : 'NO'}`.padEnd(63) + `║`);
+  lines.push(`║ Critical      : ${report.summary.criticalCount}`.padEnd(63) + `║`);
+  lines.push(`║ Warnings      : ${report.summary.warningCount}`.padEnd(63) + `║`);
+  lines.push(`║ Info          : ${report.summary.infoCount}`.padEnd(63) + `║`);
+  lines.push(`╠══════════════════════════════════════════════════════════════╣`);
+
+  if (report.violations.length === 0) {
+    lines.push(`║  No violations detected.                                     ║`);
+  } else {
+    for (const v of report.violations) {
+      const sev = v.severity.padStart(8);
+      lines.push(`║ [${sev}] (${v.x},${v.y}) L${v.layer} "${v.tileId}"`.padEnd(63) + `║`);
+      lines.push(`║        → ${v.direction} (${v.neighbourX},${v.neighbourY}) "${v.neighbourTileId}"`.padEnd(63) + `║`);
+      lines.push(`║        ${v.message.slice(0, 58)}`.padEnd(63) + `║`);
+    }
+  }
+
+  lines.push(`╠══════════════════════════════════════════════════════════════╣`);
+  lines.push(`║ CORRECTION BUFFER (${report.corrections.length} entries)`.padEnd(63) + `║`);
+  lines.push(`╚══════════════════════════════════════════════════════════════╝`);
+
+  for (const c of report.corrections.slice(0, 10)) {
+    lines.push(`  • (${c.x},${c.y}) L${c.layer}: replace "${c.currentTileId}" with one of [${c.suggestedReplacements.slice(0, 5).join(', ')}${c.suggestedReplacements.length > 5 ? '…' : ''}]`);
+  }
+  if (report.corrections.length > 10) {
+    lines.push(`  … and ${report.corrections.length - 10} more.`);
+  }
+
+  return lines.join('\n');
+}
+
+/* ---------------------------------------------------------------------------
+   SECTION 8 -- EXPORTED CONVENIENCE API
+   --------------------------------------------------------------------------- */
+
+export function createWorldTileEngine(): {
+  registry: TileRegistry;
+  biomes: Record<string, BiomeTemplate>;
+  matrix: RuleMatrix;
+  engine: LayoutIntegrityEngine;
+} {
+  const { registry, biomes } = buildMasterTileSet();
+  const compiler = new AdjacencyRuleCompiler(registry);
+  const matrix = compiler.compile();
+  const engine = new LayoutIntegrityEngine(registry, matrix);
+  return { registry, biomes, matrix, engine };
+}
+
+export function verifyLayoutIntegrity(gridArray: GridArray): IntegrityReport {
+  const { engine } = createWorldTileEngine();
+  return engine.verifyLayoutIntegrity(gridArray);
+}
+
+/* ---------------------------------------------------------------------------
+   SECTION 9 -- EXAMPLE / SMOKE TEST (commented out; run manually)
+   --------------------------------------------------------------------------- */
+
+/*
+import { verifyLayoutIntegrity, TileLayer, toTileID, GridArray } from './WorldTileRules';
+
+const testGrid: GridArray = [
+  [
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR'), [TileLayer.WALL]: toTileID('CRYPT_WALL') } },
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR'), [TileLayer.WALL]: toTileID('CRYPT_WALL') } },
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR'), [TileLayer.WALL]: toTileID('CRYPT_WALL') } },
+  ],
+  [
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR') } },
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('MANSION_WOOD_FLOOR'), [TileLayer.WALL]: toTileID('MANSION_WOOD_PANEL') } },
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR') } },
+  ],
+  [
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR'), [TileLayer.WALL]: toTileID('CRYPT_WALL') } },
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR'), [TileLayer.WALL]: toTileID('CRYPT_ARCH') } },
+    { layers: { [TileLayer.SUBFLOOR]: toTileID('CRYPT_STONE_FLOOR'), [TileLayer.WALL]: toTileID('CRYPT_WALL') } },
+  ],
+];
+
+const report = verifyLayoutIntegrity(testGrid);
+console.log(formatIntegrityReport(report));
+*/
