@@ -1,0 +1,7 @@
+.ssh/
+nerona/
+nerona_repo/
+repo/
+repo_clone/
+node_modules/
+*.log
